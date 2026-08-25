@@ -1,3 +1,5 @@
+#include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -16,6 +18,18 @@ static const char *TAG = "motor";
 #define ENC_HIGH_LIMIT  1000
 #define ENC_LOW_LIMIT   -1000
 
+#define SPEED_CTRL_PERIOD_MS      20
+#define COUNTS_PER_REV            512
+#define WHEEL_DIAMETER_CM         5.5f
+#define WHEEL_BASE_CM             9.0f
+#define DEG_TO_RAD                (3.14159265f / 180.0f)
+#define COUNTS_PER_CM             ((float)COUNTS_PER_REV / (3.14159265f * WHEEL_DIAMETER_CM))
+#define PID_KP            2.0f
+#define PID_KI            0.5f
+#define PID_KD            0.0f
+#define PID_INTEGRAL_LIMIT 400.0f
+#define SPEED_FILTER_ALPHA 0.3f
+
 #define MOTOR1_PWM_GPIO   GPIO_NUM_1
 #define MOTOR1_IN1_GPIO   GPIO_NUM_42
 #define MOTOR1_IN2_GPIO   GPIO_NUM_2
@@ -25,14 +39,47 @@ static const char *TAG = "motor";
 #define MOTOR2_PWM_GPIO   GPIO_NUM_4
 #define MOTOR2_IN1_GPIO   GPIO_NUM_5
 #define MOTOR2_IN2_GPIO   GPIO_NUM_6
-#define MOTOR2_ENC_A_GPIO GPIO_NUM_38
-#define MOTOR2_ENC_B_GPIO GPIO_NUM_39
+#define MOTOR2_ENC_A_GPIO GPIO_NUM_8
+#define MOTOR2_ENC_B_GPIO GPIO_NUM_3
 
 #define MOTOR3_PWM_GPIO   GPIO_NUM_7
 #define MOTOR3_IN1_GPIO   GPIO_NUM_16
 #define MOTOR3_IN2_GPIO   GPIO_NUM_15
-#define MOTOR3_ENC_A_GPIO GPIO_NUM_21
-#define MOTOR3_ENC_B_GPIO GPIO_NUM_20
+#define MOTOR3_ENC_A_GPIO GPIO_NUM_17
+#define MOTOR3_ENC_B_GPIO GPIO_NUM_18
+
+typedef struct {
+    float kp;
+    float ki;
+    float kd;
+    float integral;
+    float last_measured;
+} pid_t;
+
+static float pid_update(pid_t *pid, float error, float measured, bool saturated)
+{
+    float p_term = pid->kp * error;
+
+    if (!saturated) {
+        pid->integral += error;
+        if (pid->integral > PID_INTEGRAL_LIMIT) {
+            pid->integral = PID_INTEGRAL_LIMIT;
+        } else if (pid->integral < -PID_INTEGRAL_LIMIT) {
+            pid->integral = -PID_INTEGRAL_LIMIT;
+        }
+    }
+
+    float d_term = pid->kd * (pid->last_measured - measured);
+    pid->last_measured = measured;
+
+    return p_term + pid->ki * pid->integral + d_term;
+}
+
+static void pid_reset(pid_t *pid)
+{
+    pid->integral = 0;
+    pid->last_measured = 0;
+}
 
 typedef struct {
     int pwm_gpio;
@@ -42,15 +89,23 @@ typedef struct {
     int enc_b_gpio;
     ledc_channel_t pwm_channel;
     pcnt_unit_handle_t enc_unit;
+    int target_speed;
+    int last_count;
+    float measured_speed;
+    pid_t pid;
+    bool saturated;
 } motor_t;
 
 static motor_t motors[MOTOR_COUNT] = {
     {MOTOR1_PWM_GPIO, MOTOR1_IN1_GPIO, MOTOR1_IN2_GPIO,
-     MOTOR1_ENC_A_GPIO, MOTOR1_ENC_B_GPIO, LEDC_CHANNEL_0, NULL},
+     MOTOR1_ENC_A_GPIO, MOTOR1_ENC_B_GPIO, LEDC_CHANNEL_0, NULL,
+     0, 0, 0, {PID_KP, PID_KI, PID_KD, 0, 0}, false},
     {MOTOR2_PWM_GPIO, MOTOR2_IN1_GPIO, MOTOR2_IN2_GPIO,
-     MOTOR2_ENC_A_GPIO, MOTOR2_ENC_B_GPIO, LEDC_CHANNEL_1, NULL},
+     MOTOR2_ENC_A_GPIO, MOTOR2_ENC_B_GPIO, LEDC_CHANNEL_1, NULL,
+     0, 0, 0, {PID_KP, PID_KI, PID_KD, 0, 0}, false},
     {MOTOR3_PWM_GPIO, MOTOR3_IN1_GPIO, MOTOR3_IN2_GPIO,
-     MOTOR3_ENC_A_GPIO, MOTOR3_ENC_B_GPIO, LEDC_CHANNEL_2, NULL},
+     MOTOR3_ENC_A_GPIO, MOTOR3_ENC_B_GPIO, LEDC_CHANNEL_2, NULL,
+     0, 0, 0, {PID_KP, PID_KI, PID_KD, 0, 0}, false},
 };
 
 static void motors_init(void)
@@ -139,28 +194,6 @@ static void motors_init(void)
     }
 }
 
-static void motor_set_speed(int index, int speed_percent)
-{
-    if (speed_percent > 100) {
-        speed_percent = 100;
-    }
-    if (speed_percent < -100) {
-        speed_percent = -100;
-    }
-
-    if (speed_percent == 0) {
-        gpio_set_level(motors[index].in1_gpio, 0);
-        gpio_set_level(motors[index].in2_gpio, 0);
-        return;
-    }
-
-    uint32_t duty = (speed_percent < 0 ? -speed_percent : speed_percent) * MAX_DUTY / 100;
-    gpio_set_level(motors[index].in1_gpio, speed_percent > 0);
-    gpio_set_level(motors[index].in2_gpio, speed_percent < 0);
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, motors[index].pwm_channel, duty));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, motors[index].pwm_channel));
-}
-
 static void motor_brake(int index)
 {
     gpio_set_level(motors[index].in1_gpio, 1);
@@ -173,6 +206,23 @@ static void motor_coast(int index)
     gpio_set_level(motors[index].in2_gpio, 0);
 }
 
+static void motor_set_target_cm_s(int index, float speed_cm_s)
+{
+    int new_target = (int)(speed_cm_s * COUNTS_PER_CM);
+
+    if (new_target == 0) {
+        motors[index].target_speed = 0;
+        motor_coast(index);
+        pid_reset(&motors[index].pid);
+        return;
+    }
+
+    if ((new_target > 0) != (motors[index].target_speed > 0)) {
+        pid_reset(&motors[index].pid);
+    }
+    motors[index].target_speed = new_target;
+}
+
 static int encoder_get_count(int index)
 {
     int count = 0;
@@ -180,20 +230,71 @@ static int encoder_get_count(int index)
     return count;
 }
 
-static void log_encoder_counts(void)
+static void speed_ctrl_task(void *arg)
 {
-    int counts[MOTOR_COUNT];
-    for (int i = 0; i < MOTOR_COUNT; i++) {
-        counts[i] = encoder_get_count(i);
+    TickType_t last_wake = xTaskGetTickCount();
+
+    while (1) {
+        for (int i = 0; i < MOTOR_COUNT; i++) {
+            int count = encoder_get_count(i);
+            int delta = count - motors[i].last_count;
+            motors[i].last_count = count;
+
+            float measured_raw = (float)delta * 1000.0f / SPEED_CTRL_PERIOD_MS;
+            motors[i].measured_speed += (measured_raw - motors[i].measured_speed) * SPEED_FILTER_ALPHA;
+            float measured = motors[i].measured_speed;
+
+            float target = (float)motors[i].target_speed;
+            if (target == 0) {
+                continue;
+            }
+
+            float error = fabsf(target) - fabsf(measured);
+            float output = pid_update(&motors[i].pid, error, fabsf(measured), motors[i].saturated);
+
+            uint32_t duty;
+            motors[i].saturated = false;
+            if (output < 0) {
+                duty = 0;
+                motors[i].saturated = true;
+            } else if (output > MAX_DUTY) {
+                duty = MAX_DUTY;
+                motors[i].saturated = true;
+            } else {
+                duty = (uint32_t)output;
+            }
+
+            gpio_set_level(motors[i].in1_gpio, target > 0);
+            gpio_set_level(motors[i].in2_gpio, target < 0);
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, motors[i].pwm_channel, duty));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, motors[i].pwm_channel));
+        }
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SPEED_CTRL_PERIOD_MS));
     }
-    ESP_LOGI(TAG, "encoder counts: m1=%d m2=%d m3=%d", counts[0], counts[1], counts[2]);
 }
 
-static void set_2d_speed(int vx, int wz)
+static void log_measured_speeds(void)
 {
-    motor_set_speed(0, (int)(vx * 0.5 + wz));
-    motor_set_speed(2, (int)(-vx * 0.5 + wz));
-    motor_set_speed(1, (int)(wz));
+    ESP_LOGI(TAG, "m1 t=%6.1f m=%6.1f | m2 t=%6.1f m=%6.1f | m3 t=%6.1f m=%6.1f (cm/s)",
+             (float)motors[0].target_speed / COUNTS_PER_CM, motors[0].measured_speed / COUNTS_PER_CM,
+             (float)motors[1].target_speed / COUNTS_PER_CM, motors[1].measured_speed / COUNTS_PER_CM,
+             (float)motors[2].target_speed / COUNTS_PER_CM, motors[2].measured_speed / COUNTS_PER_CM);
+}
+
+#define WHEEL_A_DRIVE_DEG 30.0f
+#define WHEEL_B_DRIVE_DEG 270.0f
+#define WHEEL_D_DRIVE_DEG 150.0f
+
+static void set_speed(float vx, float vy, float wz)
+{
+    float va = 0.86602540378 * vx + 0.5 * vy + WHEEL_BASE_CM * wz;
+    float vd = -0.86602540378 * vx + 0.5 * vy + WHEEL_BASE_CM * wz;
+    float vb = -vy + WHEEL_BASE_CM * wz;
+
+    motor_set_target_cm_s(0, va);
+    motor_set_target_cm_s(1, vb);
+    motor_set_target_cm_s(2, vd);
 }
 
 void app_main(void)
@@ -201,31 +302,42 @@ void app_main(void)
     motors_init();
     ESP_LOGI(TAG, "motors initialized");
 
-    set_2d_speed(50, 0);
+    xTaskCreate(speed_ctrl_task, "speed_ctrl", 4096, NULL, 5, NULL);
 
-    // while (1) {
-    //     for (int m = 0; m < MOTOR_COUNT; m++) {
-    //         ESP_LOGI(TAG, "motor %d: forward 60%% for 2 s", m + 1);
-    //         motor_set_speed(m, 60);
-    //         for (int t = 0; t < 4; t++) {
-    //             vTaskDelay(pdMS_TO_TICKS(500));
-    //             log_encoder_counts();
-    //         }
+    while (1) {
+        ESP_LOGI(TAG, "phase: forward 10 cm/s for 3 s");
+        set_speed(20.0f, 0.0f, 0.0f);
+        for (int t = 0; t < 3; t++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            log_measured_speeds();
+        }
 
-    //         ESP_LOGI(TAG, "motor %d: brake for 1 s", m + 1);
-    //         motor_brake(m);
-    //         vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP_LOGI(TAG, "phase: left 10 cm/s for 3 s");
+        set_speed(0.0f, 20.0f, 0.0f);
+        for (int t = 0; t < 3; t++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            log_measured_speeds();
+        }
 
-    //         ESP_LOGI(TAG, "motor %d: reverse 60%% for 2 s", m + 1);
-    //         motor_set_speed(m, -60);
-    //         for (int t = 0; t < 4; t++) {
-    //             vTaskDelay(pdMS_TO_TICKS(500));
-    //             log_encoder_counts();
-    //         }
+        ESP_LOGI(TAG, "phase: rotate +0.8 rad/s for 3 s");
+        set_speed(0.0f, 0.0f, - 0.8f);
+        for (int t = 0; t < 3; t++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            log_measured_speeds();
+        }
 
-    //         ESP_LOGI(TAG, "motor %d: coast for 1 s", m + 1);
-    //         motor_coast(m);
-    //         vTaskDelay(pdMS_TO_TICKS(1000));
-    //     }
-    // }
+        ESP_LOGI(TAG, "phase: backward 10 cm/s for 3 s");
+        set_speed(-20.0f, 0.0f, 0.0f);
+        for (int t = 0; t < 3; t++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            log_measured_speeds();
+        }
+
+        ESP_LOGI(TAG, "phase: stop for 2 s");
+        set_speed(0.0f, 0.0f, 0.0f);
+        for (int i = 0; i < MOTOR_COUNT; i++) {
+            motor_brake(i);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
 }
