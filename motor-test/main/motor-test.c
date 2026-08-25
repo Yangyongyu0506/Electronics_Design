@@ -191,9 +191,9 @@ static void log_encoder_counts(void)
 
 static void set_2d_speed(int vx, int wz)
 {
-    motor_set_speed(0, vx * 0.5 + wz);
-    motor_set_speed(1, -vx * 0.5 + wz);
-    motor_set_speed(2, wz);
+    motor_set_speed(0, (int)(vx * 0.5 + wz));
+    motor_set_speed(2, (int)(-vx * 0.5 + wz));
+    motor_set_speed(1, (int)(wz));
 }
 
 void app_main(void)
@@ -201,7 +201,7 @@ void app_main(void)
     motors_init();
     ESP_LOGI(TAG, "motors initialized");
 
-    set_2d_speed(0, 20);
+    set_2d_speed(50, 0);
 
     // while (1) {
     //     for (int m = 0; m < MOTOR_COUNT; m++) {
