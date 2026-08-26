@@ -35,6 +35,11 @@ HC-SR04:
         - CH3->GPIO13
         - CH4->GPIO14
 
+    USB camera:
+
+        - D+->GPIO20
+        - D-->GPIO19
+
     小车右前方是A电机，左前方是D，后方是B。
     10顺，01逆。
     傳感器0為黑，1為白，從右至左為CH1到CH4。

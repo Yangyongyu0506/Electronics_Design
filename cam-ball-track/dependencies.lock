@@ -1,0 +1,25 @@
+dependencies:
+  espressif/usb_host_uvc:
+    component_hash: 390b12eba57359593a42c5ead724054ed0f199835d35bdbb7b6fe8517f2cfb18
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    version: 1.0.4
+  idf:
+    source:
+      type: idf
+    version: 5.4.4
+direct_dependencies:
+- espressif/usb_host_uvc
+- idf
+manifest_hash: 4e3d5874513bf6bdc850cebd0fac12e7eb55fff7d7e2c2f04f399eb662b0f84d
+target: esp32s3
+version: 2.0.0
