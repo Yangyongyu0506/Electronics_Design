@@ -246,6 +246,13 @@ struct uvc_stream_handle {
   /* listeners may only access hold*, and only when holding a
    * lock on cb_mutex (probably signaled with cb_cond) */
   uint8_t fid;
+  /** MJPEG payload assembly state (kept per stream, never process-global). */
+  uint8_t payload_mode; /* 0=unknown, 1=UVC headers, 2=raw JPEG */
+  uint8_t jpeg_prev_byte;
+  /** Bulk endpoints split one UVC payload over several USB transfers. */
+  uint8_t bulk_payload_active;
+  uint8_t bulk_header_info;
+  uint8_t bulk_payload_discard;
   uint32_t seq, hold_seq;
   uint32_t pts, hold_pts;
   uint32_t last_scr, hold_last_scr;

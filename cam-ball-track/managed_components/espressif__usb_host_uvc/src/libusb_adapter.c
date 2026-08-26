@@ -634,7 +634,6 @@ static esp_err_t wait_for_transmition_done(usb_transfer_t *xfer)
     }
 
     if (device->transfer_status != USB_TRANSFER_STATUS_COMPLETED) {
-        printf("transfer_status: %d", device->transfer_status);
         return ESP_FAIL;
     }
 

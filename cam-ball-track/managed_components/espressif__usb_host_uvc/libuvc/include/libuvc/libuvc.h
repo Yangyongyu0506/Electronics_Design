@@ -780,6 +780,18 @@ uvc_error_t uvc_set_input_select(uvc_device_handle_t *devh, uint8_t selector);
 
 void uvc_perror(uvc_error_t err, const char *msg);
 const char* uvc_strerror(uvc_error_t err);
+
+/** Lightweight counters for diagnosing the UVC callback without UART I/O. */
+typedef struct uvc_stream_counters {
+  uint32_t bulk_transfers;
+  uint32_t payload_starts;
+  uint32_t short_packets;
+  uint32_t jpeg_frames;
+  uint32_t fid_incomplete_drops;
+  uint32_t invalid_payload_drops;
+} uvc_stream_counters_t;
+
+void uvc_get_stream_counters(uvc_stream_counters_t *counters);
 void uvc_print_diag(uvc_device_handle_t *devh, FILE *stream);
 void uvc_print_stream_ctrl(uvc_stream_ctrl_t *ctrl, FILE *stream);
 

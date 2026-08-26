@@ -40,6 +40,13 @@
 #include "libuvc/libuvc_internal.h"
 #include "errno.h"
 
+static volatile uvc_stream_counters_t s_uvc_counters;
+
+void uvc_get_stream_counters(uvc_stream_counters_t *counters) {
+  if (counters)
+    *counters = s_uvc_counters;
+}
+
 #ifdef _MSC_VER
 
 #define DELTA_EPOCH_IN_MICROSECS  116444736000000000Ui64
@@ -696,12 +703,66 @@ void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
  * transfer (bulk mode)
  * @param payload_len Length of the payload transfer
  */
-void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t payload_len) {
-  size_t header_len;
-  uint8_t header_info;
-  size_t data_len;
-  static int raw_jpeg_stream = 0;
-  static uint8_t raw_prev_last_byte = 0;
+static void _uvc_drop_partial_jpeg(uvc_stream_handle_t *strmh, const char *reason) {
+  (void)reason;
+  strmh->got_bytes = 0;
+  strmh->meta_got_bytes = 0;
+  strmh->jpeg_prev_byte = 0;
+}
+
+/* Assemble complete JPEG images. JPEG entropy bytes escape 0xff, so unescaped
+ * SOI/EOI markers are safe frame boundaries. This also handles markers split
+ * across consecutive USB payloads. */
+static void _uvc_process_mjpeg_bytes(uvc_stream_handle_t *strmh,
+                                     const uint8_t *data, size_t data_len,
+                                     int *saw_soi, int *saw_eoi) {
+  for (size_t i = 0; i < data_len; ++i) {
+    uint8_t byte = data[i];
+
+    if (strmh->got_bytes == 0) {
+      if (strmh->jpeg_prev_byte == 0xff && byte == 0xd8) {
+        strmh->outbuf[0] = 0xff;
+        strmh->outbuf[1] = 0xd8;
+        strmh->got_bytes = 2;
+        *saw_soi = 1;
+      }
+      strmh->jpeg_prev_byte = byte;
+      continue;
+    }
+
+    if (strmh->got_bytes >= strmh->cur_ctrl.dwMaxVideoFrameSize) {
+      _uvc_drop_partial_jpeg(strmh, "buffer limit before EOI");
+      strmh->jpeg_prev_byte = byte;
+      continue;
+    }
+
+    strmh->outbuf[strmh->got_bytes++] = byte;
+    if (strmh->got_bytes >= 2 &&
+        strmh->outbuf[strmh->got_bytes - 2] == 0xff) {
+      if (byte == 0xd9) {
+        *saw_eoi = 1;
+        s_uvc_counters.jpeg_frames++;
+        _uvc_swap_buffers(strmh);
+        strmh->jpeg_prev_byte = 0;
+      } else if (byte == 0xd8 && strmh->got_bytes > 2) {
+        strmh->outbuf[0] = 0xff;
+        strmh->outbuf[1] = 0xd8;
+        strmh->got_bytes = 2;
+        *saw_soi = 1;
+      }
+    }
+    strmh->jpeg_prev_byte = byte;
+  }
+}
+
+static void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload,
+                                 size_t payload_len, int parse_header,
+                                 int payload_complete) {
+  size_t header_len = 0;
+  uint8_t header_info = 0;
+  size_t data_len = 0;
+  int saw_soi = 0;
+  int saw_eoi = 0;
 
   /* magic numbers for identifying header packets from some iSight cameras */
   static uint8_t isight_tag[] = {
@@ -709,30 +770,42 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
     0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xfa, 0xce
   };
 
-  /* ignore empty payload transfers */
-  if (payload_len == 0)
+  /* An empty ISOC packet has no meaning. A bulk ZLP, however, terminates the
+   * current bulk payload and must reach the completion logic below. */
+  if (payload_len == 0 && parse_header)
     return;
 
-  /* Some cameras stream raw JPEG without any UVC payload headers. Look for a
-   * JPEG SOI marker anywhere in the transfer (or split across two transfers)
-   * and, once seen, treat all subsequent payload data as raw image bytes. */
-  if (!raw_jpeg_stream && payload_len >= 2) {
-    if (raw_prev_last_byte == 0xFF && payload[0] == 0xD8) {
-      raw_jpeg_stream = 1;
-    } else {
-      for (size_t i = 0; i + 1 < payload_len; i++) {
-        if (payload[i] == 0xFF && payload[i + 1] == 0xD8) {
-          raw_jpeg_stream = 1;
+  /* A standards-compliant UVC header always has at least two bytes and sets
+   * EOH (bit 7). Do this test before looking for JPEG markers: an SOI after a
+   * valid header is normal and must not switch the stream into raw mode. */
+  int valid_uvc_header = 0;
+  if (!parse_header && strmh->bulk_payload_discard) {
+    return;
+  }
+  if (parse_header) {
+    valid_uvc_header = payload_len >= 2 && payload[0] >= 2 &&
+                       payload[0] <= payload_len && (payload[1] & 0x80);
+    if (valid_uvc_header && strmh->payload_mode != 2) {
+      strmh->payload_mode = 1;
+    } else if (strmh->payload_mode == 0 && strmh->frame_format == UVC_FRAME_FORMAT_MJPEG) {
+      for (size_t i = 0; i + 1 < payload_len; ++i) {
+        if (payload[i] == 0xff && payload[i + 1] == 0xd8) {
+          strmh->payload_mode = 2;
           break;
         }
       }
+      if (strmh->jpeg_prev_byte == 0xff && payload[0] == 0xd8)
+        strmh->payload_mode = 2;
     }
   }
-  raw_prev_last_byte = payload[payload_len - 1];
 
-  if (raw_jpeg_stream) {
-    header_len = 0;
-    header_info = 0;
+  if (!parse_header) {
+    /* Continuation of the current bulk payload: every byte is image data.
+     * In particular, never interpret JPEG bytes at a 512-byte USB boundary as
+     * bHeaderLength/bmHeaderInfo. */
+    header_info = strmh->bulk_header_info;
+    data_len = payload_len;
+  } else if (strmh->payload_mode == 2) {
     data_len = payload_len;
   } else {
     /* Certain iSight cameras have strange behavior: They send header
@@ -750,6 +823,15 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
       header_len = 0;
       data_len = payload_len;
     } else {
+      if (!valid_uvc_header) {
+        s_uvc_counters.invalid_payload_drops++;
+        if (strmh->frame_format == UVC_FRAME_FORMAT_MJPEG)
+          strmh->jpeg_prev_byte = payload[payload_len - 1];
+        strmh->bulk_payload_discard = 1;
+        _uvc_drop_partial_jpeg(strmh, "invalid UVC payload header");
+        return;
+      }
+
       header_len = payload[0];
 
       if (header_len > payload_len) {
@@ -764,16 +846,15 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
     }
   }
 
-  if (header_len < 2) {
-    header_info = 0;
-  } else {
-    /** @todo we should be checking the end-of-header bit */
+  if (header_len >= 2) {
     size_t variable_offset = 2;
 
     header_info = payload[1];
 
     if (header_info & 0x40) {
-      UVC_DEBUG("bad packet: error bit set");
+      s_uvc_counters.invalid_payload_drops++;
+      strmh->bulk_payload_discard = 1;
+      _uvc_drop_partial_jpeg(strmh, "UVC ERR bit");
       return;
     }
 
@@ -781,17 +862,35 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
       /* The frame ID bit was flipped, but we have image data sitting
          around from prior transfers. This means the camera didn't send
          an EOF for the last transfer of the previous frame. */
-      _uvc_swap_buffers(strmh);
+      if (strmh->frame_format == UVC_FRAME_FORMAT_MJPEG) {
+        s_uvc_counters.fid_incomplete_drops++;
+        _uvc_drop_partial_jpeg(strmh, "FID changed before EOI");
+      } else {
+        _uvc_swap_buffers(strmh);
+      }
     }
 
     strmh->fid = header_info & 1;
+    strmh->bulk_header_info = header_info;
 
     if (header_info & (1 << 2)) {
+      if (variable_offset + 4 > header_len) {
+        s_uvc_counters.invalid_payload_drops++;
+        strmh->bulk_payload_discard = 1;
+        _uvc_drop_partial_jpeg(strmh, "short PTS header");
+        return;
+      }
       strmh->pts = DW_TO_INT(payload + variable_offset);
       variable_offset += 4;
     }
 
     if (header_info & (1 << 3)) {
+      if (variable_offset + 6 > header_len) {
+        s_uvc_counters.invalid_payload_drops++;
+        strmh->bulk_payload_discard = 1;
+        _uvc_drop_partial_jpeg(strmh, "short SCR header");
+        return;
+      }
       /** @todo read the SOF token counter */
       strmh->last_scr = DW_TO_INT(payload + variable_offset);
       variable_offset += 6;
@@ -807,12 +906,22 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
     }
   }
 
-  if (data_len > 0) {
+  if (strmh->frame_format == UVC_FRAME_FORMAT_MJPEG) {
+    if (data_len > 0) {
+      _uvc_process_mjpeg_bytes(strmh, payload + header_len, data_len,
+                               &saw_soi, &saw_eoi);
+    }
+    /* EOF/FID are transport boundaries. A JPEG without EOI at either boundary
+     * is incomplete and must never be published to the application. */
+    if (payload_complete && (header_info & (1 << 1)) && strmh->got_bytes != 0)
+      _uvc_drop_partial_jpeg(strmh, "EOF before JPEG EOI");
+  } else if (data_len > 0) {
     if (strmh->got_bytes + data_len > strmh->cur_ctrl.dwMaxVideoFrameSize)
       data_len = strmh->cur_ctrl.dwMaxVideoFrameSize - strmh->got_bytes; /* Avoid overflow. */
     memcpy(strmh->outbuf + strmh->got_bytes, payload + header_len, data_len);
     strmh->got_bytes += data_len;
-    if (header_info & (1 << 1) || strmh->got_bytes == strmh->cur_ctrl.dwMaxVideoFrameSize) {
+    if ((payload_complete && (header_info & (1 << 1))) ||
+        strmh->got_bytes == strmh->cur_ctrl.dwMaxVideoFrameSize) {
       /* The EOF bit is set, so publish the complete frame */
       _uvc_swap_buffers(strmh);
     }
@@ -835,8 +944,23 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
   switch (transfer->status) {
   case LIBUSB_TRANSFER_COMPLETED:
     if (transfer->num_iso_packets == 0) {
-      /* This is a bulk mode transfer, so it just has one payload transfer */
-      _uvc_process_payload(strmh, transfer->buffer, transfer->actual_length);
+      /* A bulk UVC payload can span many USB transfers. A short transfer (or
+       * ZLP) ends the payload; only the first transfer contains its UVC header.
+       * This mirrors usb_host_uvc 2.5.1's SoF/Data/EoF state machine. */
+      int payload_start = !strmh->bulk_payload_active;
+      int short_packet = transfer->actual_length < transfer->length;
+      s_uvc_counters.bulk_transfers++;
+      if (payload_start)
+        s_uvc_counters.payload_starts++;
+      if (short_packet)
+        s_uvc_counters.short_packets++;
+      if (payload_start)
+        strmh->bulk_payload_discard = 0;
+      _uvc_process_payload(strmh, transfer->buffer, transfer->actual_length,
+                           payload_start, short_packet);
+      strmh->bulk_payload_active = !short_packet;
+      if (short_packet)
+        strmh->bulk_payload_discard = 0;
     } else {
       /* This is an isochronous mode transfer, so each packet has a payload transfer */
       int packet_id;
@@ -854,7 +978,7 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
 
         pktbuf = libusb_get_iso_packet_buffer_simple(transfer, packet_id);
 
-        _uvc_process_payload(strmh, pktbuf, pkt->actual_length);
+        _uvc_process_payload(strmh, pktbuf, pkt->actual_length, 1, 1);
 
       }
     }
@@ -1128,6 +1252,11 @@ uvc_error_t uvc_stream_start(
   strmh->running = 1;
   strmh->seq = 1;
   strmh->fid = 0;
+  strmh->payload_mode = 0;
+  strmh->jpeg_prev_byte = 0;
+  strmh->bulk_payload_active = 0;
+  strmh->bulk_header_info = 0;
+  strmh->bulk_payload_discard = 0;
   strmh->pts = 0;
   strmh->last_scr = 0;
 
