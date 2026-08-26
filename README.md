@@ -1,6 +1,11 @@
 # Electronics_Design
 This repository stores all the ESP32 projects used in Electronics Design curriculum.
 
+HC-SR04:
+
+    - TRIG->GPIO9
+    - ECHO->GPIO10 (use a voltage divider or level shifter to 3.3V)
+
 接线:左邊是外設，右邊是開發板
 
     TB6612:
