@@ -45,6 +45,11 @@ static const char *TAG = "red-detect";
 #define AIM_KD                       0.00015f
 #define AIM_MAX_WZ                   1.5f
 #define AIM_DEADBAND_PX              6
+#define AIM_KP_Y                     0.5f
+#define AIM_KD_Y                     0.0f
+#define AIM_MAX_VX_CM_S              20.0f
+#define AIM_DEADBAND_Y_PX            10
+#define AIM_Y_SIGN                   (-1.0f)
 #define AIM_TIMEOUT_US               500000
 #define AIM_PERIOD_MS                20
 
@@ -355,39 +360,37 @@ static void aim_ctrl_task(void *arg)
 {
     (void)arg;
     TickType_t last_wake = xTaskGetTickCount();
-    float last_err = 0.0f;
+    float last_err_x = 0.0f;
+    float last_err_y = 0.0f;
     int64_t last_t_us = 0;
 
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(AIM_PERIOD_MS));
 
         int32_t cx = 0;
+        int32_t cy = 0;
         int64_t seen_us = 0;
         portENTER_CRITICAL(&s_ball_mux);
         cx = s_ball.cx;
+        cy = s_ball.cy;
         seen_us = s_ball.last_seen_us;
         portEXIT_CRITICAL(&s_ball_mux);
 
         int64_t now_us = esp_timer_get_time();
         if (seen_us == 0 || now_us - seen_us > AIM_TIMEOUT_US) {
-            if (last_err != 0.0f) {
+            if (last_err_x != 0.0f || last_err_y != 0.0f) {
                 set_speed(0.0f, 0.0f, 0.0f);
-                last_err = 0.0f;
+                last_err_x = 0.0f;
+                last_err_y = 0.0f;
             }
             continue;
         }
 
-        float err = (float)(cx - (int32_t)(s_frame_width / 2));
+        float err_x = (float)(cx - (int32_t)(s_frame_width / 2));
+        float err_y = (float)(cy - (int32_t)(s_frame_height / 2));
         if (CAMERA_FLIPPED) {
-            err = -err;
-        }
-
-        if (fabsf(err) <= AIM_DEADBAND_PX) {
-            if (last_err != 0.0f) {
-                set_speed(0.0f, 0.0f, 0.0f);
-                last_err = 0.0f;
-            }
-            continue;
+            err_x = -err_x;
+            err_y = -err_y;
         }
 
         float dt = (last_t_us == 0) ? (AIM_PERIOD_MS / 1000.0f)
@@ -395,22 +398,39 @@ static void aim_ctrl_task(void *arg)
         if (dt <= 0.0f) {
             dt = AIM_PERIOD_MS / 1000.0f;
         }
-        float derr = (err - last_err) / dt;
-        float wz = AIM_KP * err + AIM_KD * derr;
 
-        if (wz > AIM_MAX_WZ) {
-            wz = AIM_MAX_WZ;
-        } else if (wz < -AIM_MAX_WZ) {
-            wz = -AIM_MAX_WZ;
+        float vx = 0.0f;
+        float wz = 0.0f;
+
+        if (fabsf(err_x) > AIM_DEADBAND_PX) {
+            /* Phase 1: rotate in place until x is centered. */
+            float derr_x = (err_x - last_err_x) / dt;
+            wz = AIM_KP * err_x + AIM_KD * derr_x;
+            if (wz > AIM_MAX_WZ) {
+                wz = AIM_MAX_WZ;
+            } else if (wz < -AIM_MAX_WZ) {
+                wz = -AIM_MAX_WZ;
+            }
+        } else if (fabsf(err_y) > AIM_DEADBAND_Y_PX) {
+            /* Phase 2: x aligned; drive forward/backward to center y. */
+            float derr_y = (err_y - last_err_y) / dt;
+            vx = AIM_Y_SIGN * (AIM_KP_Y * err_y + AIM_KD_Y * derr_y);
+            if (vx > AIM_MAX_VX_CM_S) {
+                vx = AIM_MAX_VX_CM_S;
+            } else if (vx < -AIM_MAX_VX_CM_S) {
+                vx = -AIM_MAX_VX_CM_S;
+            }
         }
 
-        set_speed(0.0f, 0.0f, wz);
+        set_speed(vx, 0.0f, wz);
         static uint32_t s_aim_log_skip;
         if ((s_aim_log_skip++ % 10) == 0) {
-            ESP_LOGI(TAG, "aim: err=%.1fpx wz=%.2f rad/s", (double)err, (double)wz);
+            ESP_LOGI(TAG, "aim: ex=%.1f ey=%.1f vx=%.2f wz=%.2f",
+                     (double)err_x, (double)err_y, (double)vx, (double)wz);
         }
 
-        last_err = err;
+        last_err_x = err_x;
+        last_err_y = err_y;
         last_t_us = now_us;
     }
 }

@@ -43,3 +43,10 @@ HC-SR04:
     小车右前方是A电机，左前方是D，后方是B。
     10顺，01逆。
     傳感器0為黑，1為白，從右至左為CH1到CH4。
+
+    LQ_TFT18SPIV33彩屏：
+
+        - D/C->GPIO39
+        - SDI->GPIO47
+        - SCK->GPIO21
+        - CS->GND
