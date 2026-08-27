@@ -12,6 +12,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "tft_display.h"
 
 static const char *TAG = "line-follow";
 
@@ -58,9 +59,11 @@ static const char *TAG = "line-follow";
 
 #define HC_SR04_TRIG_GPIO GPIO_NUM_9
 #define HC_SR04_ECHO_GPIO GPIO_NUM_10
-#define HC_SR04_TIMEOUT_US 5000
+#define HC_SR04_TIMEOUT_US 25000
 #define ULTRASONIC_PERIOD_MS 60
-#define OBSTACLE_DISTANCE_CM 20.0f
+#define ULTRASONIC_MIN_VALID_CM 2.0f
+#define ULTRASONIC_MAX_VALID_CM 400.0f
+#define OBSTACLE_DISTANCE_CM 6.0f
 #define OBSTACLE_CONFIRM_COUNT 3
 
 #define CONTROL_PERIOD_MS 10
@@ -80,7 +83,7 @@ static const char *TAG = "line-follow";
 #define LOST_LINE_SEARCH_RIGHT_ANGLE_RAD (70.0f * 3.14159265f / 180.0f)
 #define LOST_LINE_SEARCH_LEFT_ANGLE_RAD (140.0f * 3.14159265f / 180.0f)
 #define LOST_LINE_SEARCH_RIGHT_TIMEOUT_MS 3000
-#define LOST_LINE_SEARCH_LEFT_TIMEOUT_MS 5000/us
+#define LOST_LINE_SEARCH_LEFT_TIMEOUT_MS 5000
 #define LOST_LINE_CONFIRM_COUNT 3
 
 _Static_assert(HC_SR04_TRIG_GPIO != HC_SR04_ECHO_GPIO &&
@@ -175,6 +178,16 @@ static const int sensor_gpios[SENSOR_COUNT] = {
 };
 
 static const int sensor_weights[SENSOR_COUNT] = {-3, -1, 1, 3};
+
+typedef struct
+{
+    float distance_cm;
+    uint32_t sample_id;
+    bool valid;
+} ultrasonic_snapshot_t;
+
+static portMUX_TYPE ultrasonic_lock = portMUX_INITIALIZER_UNLOCKED;
+static ultrasonic_snapshot_t ultrasonic_snapshot;
 
 static void motors_init(void)
 {
@@ -332,7 +345,37 @@ static bool ultrasonic_read_cm(float *distance_cm)
     }
 
     *distance_cm = (float)(esp_timer_get_time() - echo_start_us) / 58.0f;
-    return true;
+    return *distance_cm >= ULTRASONIC_MIN_VALID_CM &&
+           *distance_cm <= ULTRASONIC_MAX_VALID_CM;
+}
+
+static void ultrasonic_task(void *arg)
+{
+    TickType_t last_wake = xTaskGetTickCount();
+
+    while (true)
+    {
+        float distance_cm = 0.0f;
+        bool valid = ultrasonic_read_cm(&distance_cm);
+
+        portENTER_CRITICAL(&ultrasonic_lock);
+        ultrasonic_snapshot.distance_cm = distance_cm;
+        ultrasonic_snapshot.valid = valid;
+        ultrasonic_snapshot.sample_id++;
+        portEXIT_CRITICAL(&ultrasonic_lock);
+
+        tft_display_set_distance(valid, distance_cm);
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(ULTRASONIC_PERIOD_MS));
+    }
+}
+
+static ultrasonic_snapshot_t ultrasonic_get_snapshot(void)
+{
+    ultrasonic_snapshot_t snapshot;
+    portENTER_CRITICAL(&ultrasonic_lock);
+    snapshot = ultrasonic_snapshot;
+    portEXIT_CRITICAL(&ultrasonic_lock);
+    return snapshot;
 }
 
 static void motor_brake(int index)
@@ -440,6 +483,10 @@ static void speed_ctrl_task(void *arg)
             ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, motors[i].pwm_channel));
         }
 
+        tft_display_set_motor_speeds(motors[0].measured_speed / COUNTS_PER_CM,
+                                     motors[1].measured_speed / COUNTS_PER_CM,
+                                     motors[2].measured_speed / COUNTS_PER_CM);
+
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SPEED_CTRL_PERIOD_MS));
     }
 }
@@ -501,18 +548,21 @@ void app_main(void)
     motors_init();
     sensor_init();
     ultrasonic_init();
-    ESP_LOGI(TAG, "motors, line sensor and HC-SR04 initialized");
+    ESP_ERROR_CHECK(tft_display_start());
+    ESP_LOGI(TAG, "motors, line sensor, HC-SR04 and TFT initialized");
 
     xTaskCreate(speed_ctrl_task, "speed_ctrl", 4096, NULL, 5, NULL);
+    xTaskCreate(ultrasonic_task, "ultrasonic", 2048, NULL, 3, NULL);
 
     robot_state_t state = STATE_LINE_FOLLOW;
     int64_t state_entered_ms = esp_timer_get_time() / 1000;
-    int64_t last_ultrasonic_ms = state_entered_ms - ULTRASONIC_PERIOD_MS;
+    uint32_t last_ultrasonic_sample_id = 0;
     bool line_ok = false;
     int obstacle_count = 0;
     int obstacle_clear_count = 0;
     int reacquire_count = 0;
     int lost_line_count = 0;
+    bool stop_on_line_loss_after_avoidance = false;
     uint32_t tick = 0;
 
     while (1)
@@ -522,17 +572,18 @@ void app_main(void)
         int error = 0;
         bool ok = read_line_error(&error);
 
-        if (state == STATE_LINE_FOLLOW &&
-            now_ms - last_ultrasonic_ms >= ULTRASONIC_PERIOD_MS)
+        ultrasonic_snapshot_t distance_sample = ultrasonic_get_snapshot();
+        bool new_distance_sample = distance_sample.sample_id != last_ultrasonic_sample_id;
+
+        if (state == STATE_LINE_FOLLOW && new_distance_sample)
         {
-            float distance_cm = 0.0f;
-            last_ultrasonic_ms = now_ms;
-            if (ultrasonic_read_cm(&distance_cm) && distance_cm < OBSTACLE_DISTANCE_CM)
+            last_ultrasonic_sample_id = distance_sample.sample_id;
+            if (distance_sample.valid && distance_sample.distance_cm < OBSTACLE_DISTANCE_CM)
             {
                 obstacle_count++;
                 if (obstacle_count >= OBSTACLE_CONFIRM_COUNT)
                 {
-                    ESP_LOGW(TAG, "obstacle at %.1f cm", distance_cm);
+                    ESP_LOGW(TAG, "obstacle at %.1f cm", distance_sample.distance_cm);
                     enter_state(&state, STATE_AVOID_STOP, &state_entered_ms);
                     state_ms = 0;
                     obstacle_count = 0;
@@ -584,11 +635,20 @@ void app_main(void)
             lost_line_count++;
             if (lost_line_count >= LOST_LINE_CONFIRM_COUNT)
             {
-                ESP_LOGW(TAG, "line lost, search up to 70 degrees right");
                 line_ok = false;
                 reacquire_count = 0;
-                enter_state(&state, STATE_LOST_LINE_SEARCH_RIGHT, &state_entered_ms);
-                set_speed(0.0f, 0.0f, -LOST_LINE_TURN_SPEED_RAD_S);
+                if (stop_on_line_loss_after_avoidance)
+                {
+                    ESP_LOGW(TAG, "line lost after avoidance, stop without turning");
+                    enter_state(&state, STATE_SEARCH_FAILED, &state_entered_ms);
+                    stop_and_brake();
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "line lost, search up to 70 degrees right");
+                    enter_state(&state, STATE_LOST_LINE_SEARCH_RIGHT, &state_entered_ms);
+                    set_speed(0.0f, 0.0f, -LOST_LINE_TURN_SPEED_RAD_S);
+                }
             }
         }
         else if (state == STATE_AVOID_STOP)
@@ -596,7 +656,6 @@ void app_main(void)
             if (state_ms >= AVOID_STOP_MS)
             {
                 obstacle_clear_count = 0;
-                last_ultrasonic_ms = now_ms - ULTRASONIC_PERIOD_MS;
                 enter_state(&state, STATE_AVOID_LEFT, &state_entered_ms);
             }
         }
@@ -604,21 +663,19 @@ void app_main(void)
         {
             set_speed(0.0f, AVOID_SIDE_SPEED_CM_S, 0.0f);
 
-            if (now_ms - last_ultrasonic_ms >= ULTRASONIC_PERIOD_MS)
+            if (new_distance_sample)
             {
-                float distance_cm = 0.0f;
-                last_ultrasonic_ms = now_ms;
-                bool distance_valid = ultrasonic_read_cm(&distance_cm);
-                if (distance_valid && distance_cm < OBSTACLE_DISTANCE_CM)
+                last_ultrasonic_sample_id = distance_sample.sample_id;
+                if (distance_sample.valid && distance_sample.distance_cm < OBSTACLE_DISTANCE_CM)
                 {
                     obstacle_clear_count = 0;
                 }
                 else if (++obstacle_clear_count >= AVOID_CLEAR_CONFIRM_COUNT)
                 {
-                    if (distance_valid)
+                    if (distance_sample.valid)
                     {
                         ESP_LOGI(TAG, "obstacle cleared at %.1f cm, continue left for 0.7 seconds",
-                                 distance_cm);
+                                 distance_sample.distance_cm);
                     }
                     else
                     {
@@ -632,15 +689,13 @@ void app_main(void)
         {
             set_speed(0.0f, AVOID_SIDE_SPEED_CM_S, 0.0f);
 
-            if (now_ms - last_ultrasonic_ms >= ULTRASONIC_PERIOD_MS)
+            if (new_distance_sample)
             {
-                float distance_cm = 0.0f;
-                last_ultrasonic_ms = now_ms;
-                bool distance_valid = ultrasonic_read_cm(&distance_cm);
-                if (distance_valid && distance_cm < OBSTACLE_DISTANCE_CM)
+                last_ultrasonic_sample_id = distance_sample.sample_id;
+                if (distance_sample.valid && distance_sample.distance_cm < OBSTACLE_DISTANCE_CM)
                 {
                     ESP_LOGW(TAG, "obstacle detected again at %.1f cm while moving left",
-                             distance_cm);
+                             distance_sample.distance_cm);
                     obstacle_clear_count = 0;
                     enter_state(&state, STATE_AVOID_LEFT, &state_entered_ms);
                 }
@@ -655,15 +710,13 @@ void app_main(void)
         {
             set_speed(AVOID_FORWARD_SPEED_CM_S, 0.0f, 0.0f);
 
-            if (now_ms - last_ultrasonic_ms >= ULTRASONIC_PERIOD_MS)
+            if (new_distance_sample)
             {
-                float distance_cm = 0.0f;
-                last_ultrasonic_ms = now_ms;
-                bool distance_valid = ultrasonic_read_cm(&distance_cm);
-                if (distance_valid && distance_cm < OBSTACLE_DISTANCE_CM)
+                last_ultrasonic_sample_id = distance_sample.sample_id;
+                if (distance_sample.valid && distance_sample.distance_cm < OBSTACLE_DISTANCE_CM)
                 {
                     ESP_LOGW(TAG, "obstacle detected again at %.1f cm while moving forward",
-                             distance_cm);
+                             distance_sample.distance_cm);
                     obstacle_clear_count = 0;
                     enter_state(&state, STATE_AVOID_LEFT, &state_entered_ms);
                 }
@@ -687,6 +740,7 @@ void app_main(void)
                     ESP_LOGI(TAG, "line reacquired, resume line following");
                     line_ok = true;
                     lost_line_count = 0;
+                    stop_on_line_loss_after_avoidance = true;
                     enter_state(&state, STATE_LINE_FOLLOW, &state_entered_ms);
                 }
             }
