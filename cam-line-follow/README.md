@@ -51,6 +51,7 @@ The HC-SR04 is sampled every 60 ms. Three consecutive valid readings below 6 cm 
 3. Continue left for another 700 ms.
 4. Drive forward at 18 cm/s for 2 seconds. If the obstacle appears again, return to the left-strafe step.
 5. Strafe right until the camera sees the black line in three consecutive new frames.
-6. Drive straight (no steering) until the camera misses the line in three consecutive new frames, then stop.
+6. Keep camera steering suspended and strafe left or right to center the detected line. After three consecutive centered frames, hand control back to the normal line follower.
+7. Follow the line until the camera misses it in three consecutive new frames, then stop.
 
-Obstacle avoidance has priority over camera steering. Camera line-loss handling is suspended while avoidance is active, including the final straight-ahead segment; the camera steering controller does not regain control after avoidance.
+Obstacle avoidance has priority over camera steering. Camera line-loss handling is suspended while avoidance is active, including the rightward search and lateral alignment; normal camera steering resumes only after alignment.

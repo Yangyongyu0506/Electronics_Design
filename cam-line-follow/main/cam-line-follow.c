@@ -67,7 +67,10 @@ static const char *TAG = "line-follow";
 #define AVOID_EXTRA_LEFT_MS          700
 #define AVOID_FORWARD_MS             1200
 #define LINE_REACQUIRE_CONFIRM_COUNT 3
+#define LINE_ALIGN_CONFIRM_COUNT     3
 #define LINE_LOSS_CONFIRM_COUNT      3
+#define LINE_ALIGN_DEADBAND          0.12f
+#define LINE_ALIGN_SIDE_SPEED_CM_S   8.0f
 
 #define MOTOR_COUNT   3
 #define PWM_FREQ_HZ   20000
@@ -211,7 +214,8 @@ typedef enum {
     AVOID_EXTRA_LEFT,
     AVOID_FORWARD,
     AVOID_SEARCH_LINE,
-    AVOID_DRIVE_UNTIL_LINE_LOST,
+    AVOID_ALIGN_LINE,
+    AVOID_FOLLOW_LINE_UNTIL_LOST,
     AVOID_FINISHED_STOP,
 } avoid_state_t;
 
@@ -452,6 +456,7 @@ static void ultrasonic_avoid_task(void *arg)
     int obstacle_count = 0;
     int clear_count = 0;
     int reacquire_count = 0;
+    int line_align_count = 0;
     int line_lost_count = 0;
     int64_t last_line_frame_us = 0;
 
@@ -520,20 +525,62 @@ static void ultrasonic_avoid_task(void *arg)
                 last_line_frame_us = updated_us;
                 if (total >= LINE_MIN_BLACK_PIXELS) {
                     if (++reacquire_count >= LINE_REACQUIRE_CONFIRM_COUNT) {
-                        ESP_LOGI(TAG, "line reacquired, drive straight until line ends");
-                        line_lost_count = 0;
-                        avoid_enter_state(&state, AVOID_DRIVE_UNTIL_LINE_LOST,
+                        ESP_LOGI(TAG, "line reacquired, align laterally before following");
+                        line_align_count = 0;
+                        /* Keep camera steering suspended.  The line may first
+                           appear at either side of the camera while the car is
+                           still moving right, so center it by strafing before
+                           the line follower takes ownership. */
+                        set_speed(0.0f, 0.0f, 0.0f);
+                        avoid_enter_state(&state, AVOID_ALIGN_LINE,
                                           &state_entered_ms);
                     }
                 } else {
                     reacquire_count = 0;
                 }
             }
-        } else if (state == AVOID_DRIVE_UNTIL_LINE_LOST) {
-            /* Do not invoke camera steering after avoidance: travel straight
-               over the reacquired line and stop once it ends. */
-            set_speed(AVOID_FORWARD_SPEED_CM_S, 0.0f, 0.0f);
+        } else if (state == AVOID_ALIGN_LINE) {
+            int32_t total = 0;
+            int32_t lateral_q1000 = 0;
+            int64_t updated_us = 0;
+            portENTER_CRITICAL(&s_line_mux);
+            total = s_line.black_left + s_line.black_right;
+            lateral_q1000 = s_line.lateral_q1000;
+            updated_us = s_line.updated_us;
+            portEXIT_CRITICAL(&s_line_mux);
 
+            if (updated_us != 0 && updated_us != last_line_frame_us) {
+                last_line_frame_us = updated_us;
+                if (total < LINE_MIN_BLACK_PIXELS) {
+                    /* The line disappeared while centering; resume the
+                       rightward search rather than enabling line following. */
+                    reacquire_count = 0;
+                    line_align_count = 0;
+                    avoid_enter_state(&state, AVOID_SEARCH_LINE, &state_entered_ms);
+                } else {
+                    float lateral = lateral_q1000 / 1000.0f;
+                    if (fabsf(lateral) <= LINE_ALIGN_DEADBAND) {
+                        set_speed(0.0f, 0.0f, 0.0f);
+                        if (++line_align_count >= LINE_ALIGN_CONFIRM_COUNT) {
+                            ESP_LOGI(TAG, "line aligned, hand control back to line follower");
+                            line_lost_count = 0;
+                            s_avoid_active = false;
+                            avoid_enter_state(&state, AVOID_FOLLOW_LINE_UNTIL_LOST,
+                                              &state_entered_ms);
+                        }
+                    } else {
+                        /* lateral is positive for a line to the car's left;
+                           +vy is left in the ROS2 frame. */
+                        float vy = lateral > 0.0f ? LINE_ALIGN_SIDE_SPEED_CM_S
+                                                  : -LINE_ALIGN_SIDE_SPEED_CM_S;
+                        line_align_count = 0;
+                        set_speed(0.0f, vy, 0.0f);
+                    }
+                }
+            }
+        } else if (state == AVOID_FOLLOW_LINE_UNTIL_LOST) {
+            /* Do not write a motor target here: line_ctrl_task() is actively
+               following the black line after the rightward search finds it. */
             int32_t total = 0;
             int64_t updated_us = 0;
             portENTER_CRITICAL(&s_line_mux);
@@ -546,6 +593,7 @@ static void ultrasonic_avoid_task(void *arg)
                 if (total < LINE_MIN_BLACK_PIXELS) {
                     if (++line_lost_count >= LINE_LOSS_CONFIRM_COUNT) {
                         ESP_LOGI(TAG, "line ended after avoidance, stopping");
+                        s_avoid_active = true;
                         set_speed(0.0f, 0.0f, 0.0f);
                         avoid_enter_state(&state, AVOID_FINISHED_STOP,
                                           &state_entered_ms);
