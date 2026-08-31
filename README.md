@@ -50,3 +50,4 @@ HC-SR04:
         - SDI->GPIO47
         - SCK->GPIO21
         - CS->GND
+        - RST->GPIO48
