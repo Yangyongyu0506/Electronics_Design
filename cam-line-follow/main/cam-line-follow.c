@@ -10,9 +10,10 @@
 #include "driver/pulse_cnt.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_rom_sys.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
-#include "jpeg_decoder.h"
+#include "cooperative_jpeg.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
@@ -35,17 +36,38 @@ static const char *TAG = "line-follow";
 #define FRAME_SLOT_COUNT             2
 #define LINE_LUM_THRESHOLD           100
 #define LINE_MIN_BLACK_PIXELS        4
-#define LINE_ROI_FRACTION            4
+#define LINE_ROI_FRACTION            6
 
 #define CAMERA_FLIPPED               1
 
-#define LINE_KP                      0.025f
-#define LINE_KD                      0.0005f
-#define LINE_MAX_WZ                  1.0f
-#define LINE_DEADBAND_PX             4
-#define LINE_SPEED_CM_S              10.0f
+#define LINE_KP                      1.8f
+#define LINE_KD                      0.035f
+#define LINE_MAX_WZ                  1.2f
+#define LINE_DEADBAND                0.06f
+#define LINE_SPEED_MAX_CM_S          10.0f
+#define LINE_SPEED_MIN_CM_S          1.5f
+#define LINE_PIVOT_ERROR             0.72f
+#define LINE_LOST_STOP_DELAY_MS      500
+#define LINE_FRAME_TIMEOUT_MS        300
 #define LINE_STEER_SIGN              1.0f
 #define LINE_PERIOD_MS               20
+
+#define HC_SR04_TRIG_GPIO            GPIO_NUM_9
+#define HC_SR04_ECHO_GPIO            GPIO_NUM_10
+#define HC_SR04_TIMEOUT_US           25000
+#define ULTRASONIC_PERIOD_MS         60
+#define ULTRASONIC_MIN_VALID_CM      2.0f
+#define ULTRASONIC_MAX_VALID_CM      400.0f
+#define OBSTACLE_DISTANCE_CM         6.0f
+#define OBSTACLE_CONFIRM_COUNT       3
+#define AVOID_STOP_MS                200
+#define AVOID_SIDE_SPEED_CM_S        15.0f
+#define AVOID_FORWARD_SPEED_CM_S     18.0f
+#define AVOID_CLEAR_CONFIRM_COUNT    3
+#define AVOID_EXTRA_LEFT_MS          700
+#define AVOID_FORWARD_MS             1200
+#define LINE_REACQUIRE_CONFIRM_COUNT 3
+#define LINE_LOSS_CONFIRM_COUNT      3
 
 #define MOTOR_COUNT   3
 #define PWM_FREQ_HZ   20000
@@ -173,11 +195,25 @@ static motor_t motors[MOTOR_COUNT] = {
 typedef struct {
     int32_t black_left;
     int32_t black_right;
+    int32_t lateral_q1000;
+    int32_t heading_q1000;
     int64_t updated_us;
 } line_state_t;
 
 static portMUX_TYPE s_line_mux = portMUX_INITIALIZER_UNLOCKED;
-static line_state_t s_line = {0, 0, 0};
+static line_state_t s_line = {0};
+static volatile bool s_avoid_active;
+
+typedef enum {
+    AVOID_IDLE,
+    AVOID_STOP,
+    AVOID_LEFT,
+    AVOID_EXTRA_LEFT,
+    AVOID_FORWARD,
+    AVOID_SEARCH_LINE,
+    AVOID_DRIVE_UNTIL_LINE_LOST,
+    AVOID_FINISHED_STOP,
+} avoid_state_t;
 
 static void motors_init(void)
 {
@@ -350,38 +386,257 @@ static void set_speed(float vx, float vy, float wz)
     motor_set_target_cm_s(2, vd);
 }
 
+static void ultrasonic_init(void)
+{
+    gpio_config_t trig_conf = {
+        .pin_bit_mask = 1ULL << HC_SR04_TRIG_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&trig_conf));
+
+    gpio_config_t echo_conf = {
+        .pin_bit_mask = 1ULL << HC_SR04_ECHO_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&echo_conf));
+    gpio_set_level(HC_SR04_TRIG_GPIO, 0);
+}
+
+static bool ultrasonic_read_cm(float *distance_cm)
+{
+    gpio_set_level(HC_SR04_TRIG_GPIO, 0);
+    esp_rom_delay_us(2);
+    gpio_set_level(HC_SR04_TRIG_GPIO, 1);
+    esp_rom_delay_us(10);
+    gpio_set_level(HC_SR04_TRIG_GPIO, 0);
+
+    int64_t deadline_us = esp_timer_get_time() + HC_SR04_TIMEOUT_US;
+    while (gpio_get_level(HC_SR04_ECHO_GPIO) == 0) {
+        if (esp_timer_get_time() >= deadline_us) {
+            return false;
+        }
+    }
+
+    int64_t echo_start_us = esp_timer_get_time();
+    while (gpio_get_level(HC_SR04_ECHO_GPIO) == 1) {
+        if (esp_timer_get_time() >= deadline_us) {
+            return false;
+        }
+    }
+
+    *distance_cm = (float)(esp_timer_get_time() - echo_start_us) / 58.0f;
+    return *distance_cm >= ULTRASONIC_MIN_VALID_CM &&
+           *distance_cm <= ULTRASONIC_MAX_VALID_CM;
+}
+
+static void avoid_enter_state(avoid_state_t *state, avoid_state_t next,
+                              int64_t *entered_ms)
+{
+    *state = next;
+    *entered_ms = esp_timer_get_time() / 1000;
+    ESP_LOGI(TAG, "avoid state -> %d", (int)next);
+}
+
+static void ultrasonic_avoid_task(void *arg)
+{
+    (void)arg;
+    TickType_t last_wake = xTaskGetTickCount();
+    avoid_state_t state = AVOID_IDLE;
+    int64_t state_entered_ms = esp_timer_get_time() / 1000;
+    int obstacle_count = 0;
+    int clear_count = 0;
+    int reacquire_count = 0;
+    int line_lost_count = 0;
+    int64_t last_line_frame_us = 0;
+
+    while (true) {
+        float distance_cm = 0.0f;
+        bool distance_valid = ultrasonic_read_cm(&distance_cm);
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        int64_t state_ms = now_ms - state_entered_ms;
+
+        if (state == AVOID_IDLE) {
+            if (distance_valid && distance_cm < OBSTACLE_DISTANCE_CM) {
+                if (++obstacle_count >= OBSTACLE_CONFIRM_COUNT) {
+                    ESP_LOGW(TAG, "obstacle at %.1f cm", (double)distance_cm);
+                    s_avoid_active = true;
+                    set_speed(0.0f, 0.0f, 0.0f);
+                    avoid_enter_state(&state, AVOID_STOP, &state_entered_ms);
+                    obstacle_count = 0;
+                }
+            } else {
+                obstacle_count = 0;
+            }
+        } else if (state == AVOID_STOP) {
+            set_speed(0.0f, 0.0f, 0.0f);
+            if (state_ms >= AVOID_STOP_MS) {
+                clear_count = 0;
+                avoid_enter_state(&state, AVOID_LEFT, &state_entered_ms);
+            }
+        } else if (state == AVOID_LEFT) {
+            set_speed(0.0f, AVOID_SIDE_SPEED_CM_S, 0.0f);
+            if (distance_valid && distance_cm < OBSTACLE_DISTANCE_CM) {
+                clear_count = 0;
+            } else if (++clear_count >= AVOID_CLEAR_CONFIRM_COUNT) {
+                ESP_LOGI(TAG, "obstacle cleared, continue left for %d ms",
+                         AVOID_EXTRA_LEFT_MS);
+                avoid_enter_state(&state, AVOID_EXTRA_LEFT, &state_entered_ms);
+            }
+        } else if (state == AVOID_EXTRA_LEFT) {
+            set_speed(0.0f, AVOID_SIDE_SPEED_CM_S, 0.0f);
+            if (distance_valid && distance_cm < OBSTACLE_DISTANCE_CM) {
+                clear_count = 0;
+                avoid_enter_state(&state, AVOID_LEFT, &state_entered_ms);
+            } else if (state_ms >= AVOID_EXTRA_LEFT_MS) {
+                avoid_enter_state(&state, AVOID_FORWARD, &state_entered_ms);
+            }
+        } else if (state == AVOID_FORWARD) {
+            set_speed(AVOID_FORWARD_SPEED_CM_S, 0.0f, 0.0f);
+            if (distance_valid && distance_cm < OBSTACLE_DISTANCE_CM) {
+                clear_count = 0;
+                avoid_enter_state(&state, AVOID_LEFT, &state_entered_ms);
+            } else if (state_ms >= AVOID_FORWARD_MS) {
+                reacquire_count = 0;
+                last_line_frame_us = 0;
+                avoid_enter_state(&state, AVOID_SEARCH_LINE, &state_entered_ms);
+            }
+        } else if (state == AVOID_SEARCH_LINE) {
+            set_speed(0.0f, -AVOID_SIDE_SPEED_CM_S, 0.0f);
+
+            int32_t total = 0;
+            int64_t updated_us = 0;
+            portENTER_CRITICAL(&s_line_mux);
+            total = s_line.black_left + s_line.black_right;
+            updated_us = s_line.updated_us;
+            portEXIT_CRITICAL(&s_line_mux);
+
+            if (updated_us != 0 && updated_us != last_line_frame_us) {
+                last_line_frame_us = updated_us;
+                if (total >= LINE_MIN_BLACK_PIXELS) {
+                    if (++reacquire_count >= LINE_REACQUIRE_CONFIRM_COUNT) {
+                        ESP_LOGI(TAG, "line reacquired, drive straight until line ends");
+                        line_lost_count = 0;
+                        avoid_enter_state(&state, AVOID_DRIVE_UNTIL_LINE_LOST,
+                                          &state_entered_ms);
+                    }
+                } else {
+                    reacquire_count = 0;
+                }
+            }
+        } else if (state == AVOID_DRIVE_UNTIL_LINE_LOST) {
+            /* Do not invoke camera steering after avoidance: travel straight
+               over the reacquired line and stop once it ends. */
+            set_speed(AVOID_FORWARD_SPEED_CM_S, 0.0f, 0.0f);
+
+            int32_t total = 0;
+            int64_t updated_us = 0;
+            portENTER_CRITICAL(&s_line_mux);
+            total = s_line.black_left + s_line.black_right;
+            updated_us = s_line.updated_us;
+            portEXIT_CRITICAL(&s_line_mux);
+
+            if (updated_us != 0 && updated_us != last_line_frame_us) {
+                last_line_frame_us = updated_us;
+                if (total < LINE_MIN_BLACK_PIXELS) {
+                    if (++line_lost_count >= LINE_LOSS_CONFIRM_COUNT) {
+                        ESP_LOGI(TAG, "line ended after avoidance, stopping");
+                        set_speed(0.0f, 0.0f, 0.0f);
+                        avoid_enter_state(&state, AVOID_FINISHED_STOP,
+                                          &state_entered_ms);
+                    }
+                } else {
+                    line_lost_count = 0;
+                }
+            }
+        } else if (state == AVOID_FINISHED_STOP) {
+            set_speed(0.0f, 0.0f, 0.0f);
+        }
+
+        static uint32_t log_skip;
+        if ((log_skip++ % 10) == 0) {
+            if (distance_valid) {
+                ESP_LOGI(TAG, "ultrasonic: %.1f cm avoid=%d",
+                         (double)distance_cm, (int)state);
+            } else {
+                ESP_LOGI(TAG, "ultrasonic: no echo avoid=%d", (int)state);
+            }
+        }
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(ULTRASONIC_PERIOD_MS));
+    }
+}
+
 static void line_ctrl_task(void *arg)
 {
     (void)arg;
     TickType_t last_wake = xTaskGetTickCount();
     float last_err = 0.0f;
     int64_t last_t_us = 0;
+    int64_t line_lost_since_us = 0;
 
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(LINE_PERIOD_MS));
 
-        int32_t left = 0;
-        int32_t right = 0;
-        portENTER_CRITICAL(&s_line_mux);
-        left = s_line.black_left;
-        right = s_line.black_right;
-        portEXIT_CRITICAL(&s_line_mux);
-
-        int32_t total = left + right;
-        if (total < LINE_MIN_BLACK_PIXELS) {
-            if (last_err != 0.0f) {
-                set_speed(0.0f, 0.0f, 0.0f);
-                last_err = 0.0f;
-            }
+        if (s_avoid_active) {
+            last_err = 0.0f;
+            last_t_us = 0;
+            line_lost_since_us = 0;
             continue;
         }
 
-        float err = (float)(left - right);
-        if (CAMERA_FLIPPED) {
-            err = -err;
-        }
+        int32_t left = 0;
+        int32_t right = 0;
+        int32_t lateral_q1000 = 0;
+        int32_t heading_q1000 = 0;
+        int64_t updated_us = 0;
+        portENTER_CRITICAL(&s_line_mux);
+        left = s_line.black_left;
+        right = s_line.black_right;
+        lateral_q1000 = s_line.lateral_q1000;
+        heading_q1000 = s_line.heading_q1000;
+        updated_us = s_line.updated_us;
+        portEXIT_CRITICAL(&s_line_mux);
 
         int64_t now_us = esp_timer_get_time();
+        int32_t total = left + right;
+        bool frame_stale = updated_us == 0 ||
+                           now_us - updated_us > LINE_FRAME_TIMEOUT_MS * 1000LL;
+        if (frame_stale) {
+            set_speed(0.0f, 0.0f, 0.0f);
+            last_err = 0.0f;
+            last_t_us = 0;
+            line_lost_since_us = 0;
+            continue;
+        }
+
+        if (total < LINE_MIN_BLACK_PIXELS) {
+            if (line_lost_since_us == 0) {
+                line_lost_since_us = now_us;
+            }
+            /* Keep the last motor command briefly so small gaps in the line
+               do not stop the car. Never extend this delay for stale frames. */
+            if (now_us - line_lost_since_us >=
+                LINE_LOST_STOP_DELAY_MS * 1000LL) {
+                set_speed(0.0f, 0.0f, 0.0f);
+                last_err = 0.0f;
+                last_t_us = 0;
+            }
+            continue;
+        }
+        line_lost_since_us = 0;
+
+        float lateral = lateral_q1000 / 1000.0f;
+        float heading = heading_q1000 / 1000.0f;
+        /* Deliberately do not use heading/look-ahead here. With a 90-degree
+           corner it makes the car cut across as soon as the outgoing line is
+           visible. Steering must come only from the line under the nose. */
+        float err = lateral;
+
         float dt = (last_t_us == 0) ? (LINE_PERIOD_MS / 1000.0f)
                                     : (float)(now_us - last_t_us) / 1000000.0f;
         if (dt <= 0.0f) {
@@ -389,7 +644,7 @@ static void line_ctrl_task(void *arg)
         }
 
         float wz = 0.0f;
-        if (fabsf(err) > LINE_DEADBAND_PX) {
+        if (fabsf(err) > LINE_DEADBAND) {
             float derr = (err - last_err) / dt;
             wz = LINE_STEER_SIGN * (LINE_KP * err + LINE_KD * derr);
             if (wz > LINE_MAX_WZ) {
@@ -399,12 +654,19 @@ static void line_ctrl_task(void *arg)
             }
         }
 
-        set_speed(LINE_SPEED_CM_S, 0.0f, wz);
+        float abs_err = fminf(fabsf(err), 1.0f);
+        float vx = LINE_SPEED_MAX_CM_S -
+                   (LINE_SPEED_MAX_CM_S - LINE_SPEED_MIN_CM_S) * abs_err;
+        if (abs_err >= LINE_PIVOT_ERROR) {
+            vx = 0.0f;
+        }
+        set_speed(vx, 0.0f, wz);
 
         static uint32_t s_line_log_skip;
         if ((s_line_log_skip++ % 10) == 0) {
-            ESP_LOGI(TAG, "follow: diff=%d total=%d wz=%.2f",
-                     (int)(left - right), (int)total, (double)wz);
+            ESP_LOGI(TAG, "follow: lateral=%.2f heading=%.2f total=%d vx=%.1f wz=%.2f",
+                     (double)lateral, (double)heading, (int)total,
+                     (double)vx, (double)wz);
         }
 
         last_err = err;
@@ -437,7 +699,7 @@ static void detect_line_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
         },
     };
     esp_jpeg_image_output_t image = {0};
-    esp_err_t err = esp_jpeg_decode(&jpeg_cfg, &image);
+    esp_err_t err = cooperative_jpeg_decode(&jpeg_cfg, &image);
     if (err != ESP_OK || image.width == 0 || image.height == 0) {
         ESP_LOGW(TAG, "JPEG decode failed: %s", esp_err_to_name(err));
         return;
@@ -452,6 +714,8 @@ static void detect_line_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
     const uint32_t y_end = CAMERA_FLIPPED ? image.height / LINE_ROI_FRACTION : image.height;
     uint32_t black_left = 0;
     uint32_t black_right = 0;
+    uint32_t black_count = 0;
+    uint32_t black_x_sum = 0;
 
     for (uint32_t y = y_start; y < y_end; ++y) {
         for (uint32_t x = 0; x < image.width; ++x) {
@@ -460,25 +724,45 @@ static void detect_line_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
             const int g = ((p >> 5) & 0x3f) * 255 / 63;
             const int b = (p & 0x1f) * 255 / 31;
             if (is_black_pixel(r, g, b)) {
-                if (x < half) {
+                /* Express x in the car's view, not the upside-down sensor view. */
+                uint32_t car_x = CAMERA_FLIPPED ? image.width - 1 - x : x;
+                if (car_x < half) {
                     ++black_left;
                 } else {
                     ++black_right;
                 }
+
+                black_x_sum += car_x;
+                ++black_count;
             }
         }
     }
 
+    const float center = (image.width - 1) * 0.5f;
+    const float half_width = center > 0.0f ? center : 1.0f;
+    float line_pos = 0.0f;
+    if (black_count > 0) {
+        line_pos = ((float)black_x_sum / black_count - center) / half_width;
+    }
+
+    /* Only the nearest eighth contributes. Positive control error means turn
+       CCW, so a line to the car's right produces a negative error. */
+    float lateral = -line_pos;
+    float heading = 0.0f;
+
     portENTER_CRITICAL(&s_line_mux);
     s_line.black_left = (int32_t)black_left;
     s_line.black_right = (int32_t)black_right;
+    s_line.lateral_q1000 = (int32_t)lroundf(lateral * 1000.0f);
+    s_line.heading_q1000 = (int32_t)lroundf(heading * 1000.0f);
     s_line.updated_us = esp_timer_get_time();
     portEXIT_CRITICAL(&s_line_mux);
 
     if (log_now) {
-        ESP_LOGI(TAG, "line: left=%u right=%u total=%u",
+        ESP_LOGI(TAG, "line: left=%u right=%u total=%u lateral=%.2f heading=%.2f",
                  (unsigned)black_left, (unsigned)black_right,
-                 (unsigned)(black_left + black_right));
+                 (unsigned)(black_left + black_right),
+                 (double)lateral, (double)heading);
     }
 }
 
@@ -559,8 +843,13 @@ static void frame_processing_task(void *arg)
             last_reported_drops = drops;
         }
 
+        /* JPEG decoding can keep CPU0 busy continuously when frames arrive
+           back-to-back. Always yield so the watched IDLE0 task can run;
+           wait a little longer when capture is already backed up. */
         if (uxQueueMessagesWaiting(s_ready_frames) > 0) {
             vTaskDelay(pdMS_TO_TICKS(5));
+        } else {
+            vTaskDelay(1);
         }
     }
 }
@@ -787,9 +1076,11 @@ void app_main(void)
     assert(xTaskCreate(uvc_stats_task, "uvc_stats", 3072, NULL, 2, NULL) == pdPASS);
 
     motors_init();
-    ESP_LOGI(TAG, "motors initialized");
+    ultrasonic_init();
+    ESP_LOGI(TAG, "motors and HC-SR04 initialized");
     assert(xTaskCreate(speed_ctrl_task, "speed_ctrl", 4096, NULL, 5, NULL) == pdPASS);
     assert(xTaskCreate(line_ctrl_task, "line_ctrl", 4096, NULL, 4, NULL) == pdPASS);
+    assert(xTaskCreate(ultrasonic_avoid_task, "ultrasonic", 3072, NULL, 3, NULL) == pdPASS);
 
     libuvc_adapter_config_t adapter_config = {
         .create_background_task = true,
