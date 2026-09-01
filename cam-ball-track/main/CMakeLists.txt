@@ -1,4 +1,4 @@
-idf_component_register(SRCS "cam-ball-track.c"
+idf_component_register(SRCS "cooperative_jpeg.c" "cam-ball-track.c"
                     INCLUDE_DIRS "."
                     PRIV_REQUIRES
                         usb

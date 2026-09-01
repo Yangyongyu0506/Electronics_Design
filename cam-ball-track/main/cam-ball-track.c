@@ -13,6 +13,7 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "jpeg_decoder.h"
+#include "cooperative_jpeg.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
@@ -38,18 +39,27 @@ static const char *TAG = "ball-track";
 #define RED_HUE_MAX_ANGLE            12
 #define RED_HUE_MIN_ANGLE            300
 #define BALL_MIN_PIXELS               18
+#define GREEN_MIN_VALUE               129
+#define GREEN_MIN_SATURATION          19
+#define GREEN_HUE_MIN_ANGLE           167
+#define GREEN_HUE_MAX_ANGLE           187
+#define GREEN_DETECT_RATIO_PERCENT    0.2f
 
 #define CAMERA_FLIPPED               0
 
 #define BALL_STALE_US                450000
 #define BALL_TASK_PERIOD_MS          30
 #define SEARCH_WZ_RAD_S              0.65f
-#define APPROACH_SPEED_CM_S          8.0f
-#define APPROACH_TIME_MS              5000
+#define ALIGN_KP                     0.012f
+#define ALIGN_MAX_WZ_RAD_S           1.25f
+#define ALIGN_DEADBAND_PX            8
+#define APPROACH_SPEED_CM_S          50.0f
+/* 0.5 m at 50 cm/s = 1.0 s. */
+#define APPROACH_TIME_MS              1000
 #define LOCK_DIRECTION_STOP_MS        1000
 #define STOP_AFTER_APPROACH_MS         300
 #define RETURN_SPEED_CM_S            (-10.0f)
-#define RETURN_TIME_MS               900
+#define RETURN_TIME_MS               4000
 
 #define MOTOR_COUNT   3
 #define PWM_FREQ_HZ   20000
@@ -365,6 +375,7 @@ static void set_speed(float vx, float vy, float wz)
 
 typedef enum {
     TASK_SEARCH,
+    TASK_ALIGN_DIRECTION,
     TASK_LOCK_DIRECTION,
     TASK_APPROACH_BALL,
     TASK_STOP_AFTER_APPROACH,
@@ -397,8 +408,6 @@ static void ball_task_ctrl(void *arg)
     task_phase_t phase = TASK_SEARCH;
     ball_color_t wanted = BALL_RED;
     int64_t phase_started_us = esp_timer_get_time();
-    float locked_approach_vx = APPROACH_SPEED_CM_S;
-    float locked_approach_vy = 0.0f;
     TickType_t last_wake = xTaskGetTickCount();
 
     while (true) {
@@ -431,22 +440,27 @@ static void ball_task_ctrl(void *arg)
                 set_speed(0.0f, 0.0f, search_wz);
                 break;
             }
-            ESP_LOGI(TAG, "%s ball found at (%ld,%ld); locking approach direction", ball_name(wanted),
+            ESP_LOGI(TAG, "%s ball found at (%ld,%ld); aligning direction", ball_name(wanted),
                      (long)ball.cx, (long)ball.cy);
-            /*
-             * Lock the first sighting as a translation vector.  Using wz here
-             * would rotate for the whole five-second movement and make a circle.
-             * ROS y is left-positive; image x is right-positive.
-             */
-            const float lateral = clampf((image_center_x - ball.cx) / image_center_x,
-                                         -1.0f, 1.0f);
-            const float direction = atanf(lateral);
-            locked_approach_vx = APPROACH_SPEED_CM_S * cosf(direction);
-            locked_approach_vy = APPROACH_SPEED_CM_S * sinf(direction);
             set_speed(0.0f, 0.0f, 0.0f);
-            phase = TASK_LOCK_DIRECTION;
+            phase = TASK_ALIGN_DIRECTION;
             phase_started_us = now_us;
             break;
+
+        case TASK_ALIGN_DIRECTION: {
+            const float error_x = ball.cx - image_center_x;
+            const float wz = clampf(ALIGN_KP * error_x,
+                                    -ALIGN_MAX_WZ_RAD_S, ALIGN_MAX_WZ_RAD_S);
+            if (fabsf(error_x) <= ALIGN_DEADBAND_PX) {
+                set_speed(0.0f, 0.0f, 0.0f);
+                ESP_LOGI(TAG, "%s direction aligned; waiting one second", ball_name(wanted));
+                phase = TASK_LOCK_DIRECTION;
+                phase_started_us = now_us;
+            } else {
+                set_speed(0.0f, 0.0f, wz);
+            }
+            break;
+        }
 
         case TASK_LOCK_DIRECTION:
             /* Keep still for one second after the initial ball direction is captured. */
@@ -460,8 +474,8 @@ static void ball_task_ctrl(void *arg)
             break;
 
         case TASK_APPROACH_BALL: {
-            /* Move in the fixed direction captured at first sighting; do not rotate. */
-            set_speed(locked_approach_vx, locked_approach_vy, 0.0f);
+            /* Direction is already aligned, so travel straight forward. */
+            set_speed(APPROACH_SPEED_CM_S, 0.0f, 0.0f);
             if (now_us - phase_started_us >= (int64_t)APPROACH_TIME_MS * 1000) {
                 set_speed(0.0f, 0.0f, 0.0f);
                 ESP_LOGI(TAG, "%s five-second approach complete; stopping", ball_name(wanted));
@@ -512,7 +526,10 @@ static bool is_mjpeg_format(const uvc_format_desc_t *format)
 static bool is_ball_rgb(ball_color_t color, int r, int g, int b,
                         int mx, int mn, int delta)
 {
-    if (mx < RED_MIN_VALUE || delta < RED_MIN_SATURATION) {
+    const int min_value = color == BALL_GREEN ? GREEN_MIN_VALUE : RED_MIN_VALUE;
+    const int min_saturation = color == BALL_GREEN ? GREEN_MIN_SATURATION
+                                                    : RED_MIN_SATURATION;
+    if (mx < min_value || delta < min_saturation) {
         return false;
     }
 
@@ -531,7 +548,7 @@ static bool is_ball_rgb(ball_color_t color, int r, int g, int b,
     if (color == BALL_RED) {
         return h6 <= RED_HUE_MAX_ANGLE || h6 >= RED_HUE_MIN_ANGLE;
     }
-    return h6 >= 65 && h6 <= 175;
+    return h6 >= GREEN_HUE_MIN_ANGLE && h6 <= GREEN_HUE_MAX_ANGLE;
 }
 
 static void detect_balls_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
@@ -548,7 +565,7 @@ static void detect_balls_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
         },
     };
     esp_jpeg_image_output_t image = {0};
-    esp_err_t err = esp_jpeg_decode(&jpeg_cfg, &image);
+    esp_err_t err = cooperative_jpeg_decode(&jpeg_cfg, &image);
     if (err != ESP_OK || image.width == 0 || image.height == 0) {
         ESP_LOGW(TAG, "JPEG decode failed: %s", esp_err_to_name(err));
         return;
@@ -595,7 +612,11 @@ static void detect_balls_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
         if (color != detection_target) {
             continue;
         }
-        if (count[color] < BALL_MIN_PIXELS) {
+        const uint32_t min_pixels = color == BALL_GREEN
+            ? (uint32_t)ceilf((float)image.width * image.height *
+                              GREEN_DETECT_RATIO_PERCENT / 100.0f)
+            : BALL_MIN_PIXELS;
+        if (count[color] < min_pixels) {
             continue;
         }
         int32_t cx = (int32_t)(sum_x[color] * s_decode_scale_divisor / count[color]);
