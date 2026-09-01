@@ -65,7 +65,7 @@ static const char *TAG = "line-ball";
 #define AVOID_FORWARD_SPEED_CM_S     18.0f
 #define AVOID_CLEAR_CONFIRM_COUNT    3
 #define AVOID_EXTRA_LEFT_MS          700
-#define AVOID_FORWARD_MS             1200
+#define AVOID_FORWARD_MS             1500
 #define LINE_REACQUIRE_CONFIRM_COUNT 3
 #define LINE_ALIGN_CONFIRM_COUNT     3
 #define LINE_LOSS_CONFIRM_COUNT      3
@@ -78,15 +78,17 @@ static const char *TAG = "line-ball";
 #define RED_HUE_MAX_ANGLE            12
 #define RED_HUE_MIN_ANGLE            300
 #define BALL_MIN_PIXELS              18
-#define GREEN_MIN_VALUE              129
-#define GREEN_MIN_SATURATION         19
-#define GREEN_HUE_MIN_ANGLE          167
-#define GREEN_HUE_MAX_ANGLE          187
-#define GREEN_DETECT_RATIO_PERCENT   0.2f
-#define BALL_STALE_US                450000
+#define GREEN_MIN_VALUE              60
+#define GREEN_MIN_SATURATION         10
+#define GREEN_HUE_MIN_ANGLE          90
+#define GREEN_HUE_MAX_ANGLE          155
+#define GREEN_DETECT_RATIO_PERCENT   0.1f
+#define BALL_STALE_US                1500000
+#define BALL_START_DELAY_MS          3000
 #define BALL_TASK_PERIOD_MS          30
 #define SEARCH_WZ_RAD_S              0.65f
-#define ALIGN_KP                     0.012f
+#define RED_ALIGN_KP                 0.012f
+#define GREEN_ALIGN_KP               0.010f
 #define ALIGN_MAX_WZ_RAD_S           1.25f
 #define ALIGN_DEADBAND_PX            8
 #define APPROACH_SPEED_CM_S          50.0f
@@ -95,6 +97,18 @@ static const char *TAG = "line-ball";
 #define STOP_AFTER_APPROACH_MS       300
 #define RETURN_SPEED_CM_S            (-10.0f)
 #define RETURN_TIME_MS               4000
+
+/* MG90S servo configuration. Change only these values when wiring or the
+   required raised position changes. GPIO14 is an intentionally replaceable
+   placeholder and is not used by the current camera, motor, or sensor wiring. */
+#define SERVO_PWM_GPIO               GPIO_NUM_14
+#define SERVO_PWM_TIMER              LEDC_TIMER_1
+#define SERVO_PWM_CHANNEL            LEDC_CHANNEL_3
+#define SERVO_PWM_FREQ_HZ            50
+#define SERVO_PWM_RESOLUTION         LEDC_TIMER_14_BIT
+#define SERVO_INITIAL_DUTY_PERCENT   9.5f
+#define SERVO_SEARCH_DUTY_PERCENT    8.5f
+
 #define MOTOR_COUNT   3
 #define PWM_FREQ_HZ   20000
 #define MAX_DUTY      1023
@@ -248,6 +262,82 @@ static ball_state_t s_balls[BALL_COLOR_COUNT];
 /* The camera only publishes the colour currently being handled by the task. */
 static ball_color_t s_detection_target = BALL_RED;
 static volatile bool s_ball_mode_active;
+static volatile bool s_ball_detection_active;
+static bool s_servo_raised;
+
+static uint32_t servo_percent_to_duty(float duty_percent)
+{
+    if (duty_percent < 0.0f) {
+        duty_percent = 0.0f;
+    } else if (duty_percent > 100.0f) {
+        duty_percent = 100.0f;
+    }
+
+    const uint32_t duty_max = (1U << LEDC_TIMER_14_BIT) - 1U;
+    return (uint32_t)(duty_percent * duty_max / 100.0f);
+}
+
+static void servo_init(void)
+{
+    ledc_timer_config_t timer_conf = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = SERVO_PWM_RESOLUTION,
+        .timer_num = SERVO_PWM_TIMER,
+        .freq_hz = SERVO_PWM_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
+
+    ledc_channel_config_t channel_conf = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = SERVO_PWM_CHANNEL,
+        .timer_sel = SERVO_PWM_TIMER,
+        .intr_type = LEDC_INTR_DISABLE,
+        .gpio_num = SERVO_PWM_GPIO,
+        /* Command the configured initial duty immediately at power-on. */
+        .duty = servo_percent_to_duty(SERVO_INITIAL_DUTY_PERCENT),
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&channel_conf));
+    ESP_LOGI(TAG, "MG90S initialized at %.1f%% duty",
+             (double)SERVO_INITIAL_DUTY_PERCENT);
+}
+
+/* LEDC keeps generating this pulse in hardware; no delay or servo task is needed. */
+static void servo_raise_for_ball_search(void)
+{
+    if (s_servo_raised) {
+        return;
+    }
+
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, SERVO_PWM_CHANNEL,
+                                  servo_percent_to_duty(SERVO_SEARCH_DUTY_PERCENT)));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, SERVO_PWM_CHANNEL));
+    s_servo_raised = true;
+    ESP_LOGI(TAG, "MG90S search position set to %.1f%% duty",
+             (double)SERVO_SEARCH_DUTY_PERCENT);
+}
+
+/*
+ * This is the single hand-over point between the line and ball missions.
+ * Clear any old result first, so the ball controller can only act on frames
+ * acquired after the line-following mission has ended.
+ */
+static void start_ball_tracking(void)
+{
+    portENTER_CRITICAL(&s_ball_mux);
+    s_detection_target = BALL_RED;
+    s_balls[BALL_RED] = (ball_state_t){0};
+    s_balls[BALL_GREEN] = (ball_state_t){0};
+    portEXIT_CRITICAL(&s_ball_mux);
+
+    /* Keep the chassis stopped during the hand-over delay, but do not let
+       pre-delay camera frames count as ball detections. */
+    s_ball_detection_active = false;
+    s_ball_mode_active = true;
+    ESP_LOGI(TAG, "line mission complete; waiting %d ms before ball tracking",
+             BALL_START_DELAY_MS);
+}
 
 static void motors_init(void)
 {
@@ -503,6 +593,13 @@ static void ultrasonic_avoid_task(void *arg)
     int64_t last_line_frame_us = 0;
 
     while (true) {
+        /* Once ball tracking owns the motors, never start a new avoidance
+           maneuver or overwrite its speed commands. */
+        if (s_ball_mode_active) {
+            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(ULTRASONIC_PERIOD_MS));
+            continue;
+        }
+
         float distance_cm = 0.0f;
         bool distance_valid = ultrasonic_read_cm(&distance_cm);
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -646,6 +743,7 @@ static void ultrasonic_avoid_task(void *arg)
             }
         } else if (state == AVOID_FINISHED_STOP) {
             set_speed(0.0f, 0.0f, 0.0f);
+            start_ball_tracking();
         }
 
         static uint32_t log_skip;
@@ -716,7 +814,7 @@ static void line_ctrl_task(void *arg)
                 last_err = 0.0f;
                 last_t_us = 0;
                 ESP_LOGI(TAG, "line lost; switching to ball tracking");
-                s_ball_mode_active = true;
+                start_ball_tracking();
             } else {
                 set_speed(LINE_SPEED_MAX_CM_S, 0.0f, 0.0f);
             }
@@ -796,6 +894,11 @@ static float clampf(float value, float minimum, float maximum)
     return value < minimum ? minimum : (value > maximum ? maximum : value);
 }
 
+static float ball_align_kp(ball_color_t color)
+{
+    return color == BALL_GREEN ? GREEN_ALIGN_KP : RED_ALIGN_KP;
+}
+
 /* For each colour, drive for two seconds from its first camera sighting. */
 static void ball_task_ctrl(void *arg)
 {
@@ -803,7 +906,12 @@ static void ball_task_ctrl(void *arg)
     while (!s_ball_mode_active) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
-    ESP_LOGI(TAG, "line lost; ball tracking started");
+
+    /* This delay blocks only this task. Camera decoding and the motor-speed
+       controller continue running, while the hand-over code keeps the car still. */
+    vTaskDelay(pdMS_TO_TICKS(BALL_START_DELAY_MS));
+    s_ball_detection_active = true;
+    ESP_LOGI(TAG, "ball tracking started; red-ball detection enabled");
     task_phase_t phase = TASK_SEARCH;
     ball_color_t wanted = BALL_RED;
     int64_t phase_started_us = esp_timer_get_time();
@@ -832,6 +940,8 @@ static void ball_task_ctrl(void *arg)
 
         switch (phase) {
         case TASK_SEARCH:
+            /* Raise once on the first search. Do not lower it in later phases. */
+            servo_raise_for_ball_search();
             if (!visible) {
                 /* Red is searched by turning left (CCW+); green by turning right. */
                 const float search_wz = wanted == BALL_RED ? SEARCH_WZ_RAD_S
@@ -848,7 +958,7 @@ static void ball_task_ctrl(void *arg)
 
         case TASK_ALIGN_DIRECTION: {
             const float error_x = ball.cx - image_center_x;
-            const float wz = clampf(ALIGN_KP * error_x,
+            const float wz = clampf(ball_align_kp(wanted) * error_x,
                                     -ALIGN_MAX_WZ_RAD_S, ALIGN_MAX_WZ_RAD_S);
             if (fabsf(error_x) <= ALIGN_DEADBAND_PX) {
                 set_speed(0.0f, 0.0f, 0.0f);
@@ -992,6 +1102,7 @@ static void detect_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
     portENTER_CRITICAL(&s_ball_mux);
     detection_target = s_detection_target;
     portEXIT_CRITICAL(&s_ball_mux);
+    const bool ball_detection_active = s_ball_detection_active;
 
     uint32_t count[BALL_COLOR_COUNT] = {0};
     uint64_t sum_x[BALL_COLOR_COUNT] = {0};
@@ -1021,7 +1132,8 @@ static void detect_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
                 ++black_count;
             }
 
-            if (is_ball_rgb(detection_target, r, g, b, mx, mn, delta)) {
+            if (ball_detection_active &&
+                is_ball_rgb(detection_target, r, g, b, mx, mn, delta)) {
                 ++count[detection_target];
                 sum_x[detection_target] += x;
                 sum_y[detection_target] += y;
@@ -1388,9 +1500,10 @@ void app_main(void)
     ESP_ERROR_CHECK(initialize_usb_host_lib());
     assert(xTaskCreate(uvc_stats_task, "uvc_stats", 3072, NULL, 2, NULL) == pdPASS);
 
+    servo_init();
     motors_init();
     ultrasonic_init();
-    ESP_LOGI(TAG, "motors and HC-SR04 initialized");
+    ESP_LOGI(TAG, "MG90S, motors and HC-SR04 initialized");
     assert(xTaskCreate(speed_ctrl_task, "speed_ctrl", 4096, NULL, 5, NULL) == pdPASS);
     assert(xTaskCreate(ultrasonic_avoid_task, "ultrasonic", 3072, NULL, 3, NULL) == pdPASS);
     assert(xTaskCreate(line_ctrl_task, "line_ctrl", 4096, NULL, 4, NULL) == pdPASS);
