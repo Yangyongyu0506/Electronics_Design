@@ -21,7 +21,7 @@
 #include "libuvc_adapter.h"
 #include "usb/usb_host.h"
 
-static const char *TAG = "red-detect";
+static const char *TAG = "ball-track";
 
 #define MAX_MODE_CANDIDATES          32
 #define PREFERRED_WIDTH              320
@@ -37,21 +37,19 @@ static const char *TAG = "red-detect";
 #define RED_MIN_SATURATION           25
 #define RED_HUE_MAX_ANGLE            12
 #define RED_HUE_MIN_ANGLE            300
-#define RED_DETECT_RATIO_PERCENT     0.5f
+#define BALL_MIN_PIXELS               18
 
 #define CAMERA_FLIPPED               0
 
-#define AIM_KP                       0.01f
-#define AIM_KD                       0.00015f
-#define AIM_MAX_WZ                   1.5f
-#define AIM_DEADBAND_PX              6
-#define AIM_KP_Y                     0.5f
-#define AIM_KD_Y                     0.0f
-#define AIM_MAX_VX_CM_S              20.0f
-#define AIM_DEADBAND_Y_PX            10
-#define AIM_Y_SIGN                   (-1.0f)
-#define AIM_TIMEOUT_US               500000
-#define AIM_PERIOD_MS                20
+#define BALL_STALE_US                450000
+#define BALL_TASK_PERIOD_MS          30
+#define SEARCH_WZ_RAD_S              0.65f
+#define APPROACH_SPEED_CM_S          8.0f
+#define APPROACH_TIME_MS              5000
+#define LOCK_DIRECTION_STOP_MS        1000
+#define STOP_AFTER_APPROACH_MS         300
+#define RETURN_SPEED_CM_S            (-10.0f)
+#define RETURN_TIME_MS               900
 
 #define MOTOR_COUNT   3
 #define PWM_FREQ_HZ   20000
@@ -176,14 +174,23 @@ static motor_t motors[MOTOR_COUNT] = {
      0, 0, 0, {PID_KP, PID_KI, PID_KD, 0, 0}, false},
 };
 
+typedef enum {
+    BALL_RED,
+    BALL_GREEN,
+    BALL_COLOR_COUNT,
+} ball_color_t;
+
 typedef struct {
     int32_t cx;
     int32_t cy;
+    uint32_t pixels;
     int64_t last_seen_us;
 } ball_state_t;
 
 static portMUX_TYPE s_ball_mux = portMUX_INITIALIZER_UNLOCKED;
-static ball_state_t s_ball = {0, 0, 0};
+static ball_state_t s_balls[BALL_COLOR_COUNT];
+/* The camera only publishes the colour currently being handled by the task. */
+static ball_color_t s_detection_target = BALL_RED;
 
 static void motors_init(void)
 {
@@ -356,82 +363,144 @@ static void set_speed(float vx, float vy, float wz)
     motor_set_target_cm_s(2, vd);
 }
 
-static void aim_ctrl_task(void *arg)
+typedef enum {
+    TASK_SEARCH,
+    TASK_LOCK_DIRECTION,
+    TASK_APPROACH_BALL,
+    TASK_STOP_AFTER_APPROACH,
+    TASK_RETURN_TO_WAIT,
+    TASK_COMPLETE,
+} task_phase_t;
+
+static const char *ball_name(ball_color_t color)
+{
+    return color == BALL_RED ? "red" : "green";
+}
+
+static bool get_fresh_ball(ball_color_t color, ball_state_t *ball, int64_t now_us)
+{
+    portENTER_CRITICAL(&s_ball_mux);
+    *ball = s_balls[color];
+    portEXIT_CRITICAL(&s_ball_mux);
+    return ball->last_seen_us != 0 && now_us - ball->last_seen_us <= BALL_STALE_US;
+}
+
+static float clampf(float value, float minimum, float maximum)
+{
+    return value < minimum ? minimum : (value > maximum ? maximum : value);
+}
+
+/* For each colour, drive for two seconds from its first camera sighting. */
+static void ball_task_ctrl(void *arg)
 {
     (void)arg;
+    task_phase_t phase = TASK_SEARCH;
+    ball_color_t wanted = BALL_RED;
+    int64_t phase_started_us = esp_timer_get_time();
+    float locked_approach_vx = APPROACH_SPEED_CM_S;
+    float locked_approach_vy = 0.0f;
     TickType_t last_wake = xTaskGetTickCount();
-    float last_err_x = 0.0f;
-    float last_err_y = 0.0f;
-    int64_t last_t_us = 0;
 
-    while (1) {
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(AIM_PERIOD_MS));
+    while (true) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(BALL_TASK_PERIOD_MS));
+        const int64_t now_us = esp_timer_get_time();
+        ball_state_t ball;
+        const bool visible = get_fresh_ball(wanted, &ball, now_us);
+        const float image_center_x = s_frame_width / 2.0f;
 
-        int32_t cx = 0;
-        int32_t cy = 0;
-        int64_t seen_us = 0;
-        portENTER_CRITICAL(&s_ball_mux);
-        cx = s_ball.cx;
-        cy = s_ball.cy;
-        seen_us = s_ball.last_seen_us;
-        portEXIT_CRITICAL(&s_ball_mux);
-
-        int64_t now_us = esp_timer_get_time();
-        if (seen_us == 0 || now_us - seen_us > AIM_TIMEOUT_US) {
-            if (last_err_x != 0.0f || last_err_y != 0.0f) {
-                set_speed(0.0f, 0.0f, 0.0f);
-                last_err_x = 0.0f;
-                last_err_y = 0.0f;
-            }
+        if (phase == TASK_COMPLETE) {
+            set_speed(0.0f, 0.0f, 0.0f);
             continue;
         }
 
-        float err_x = (float)(cx - (int32_t)(s_frame_width / 2));
-        float err_y = (float)(cy - (int32_t)(s_frame_height / 2));
-        if (CAMERA_FLIPPED) {
-            err_x = -err_x;
-            err_y = -err_y;
+        if (!visible && phase != TASK_SEARCH && phase != TASK_LOCK_DIRECTION &&
+            phase != TASK_APPROACH_BALL &&
+            phase != TASK_STOP_AFTER_APPROACH &&
+            phase != TASK_RETURN_TO_WAIT) {
+            ESP_LOGW(TAG, "%s ball lost; returning to search", ball_name(wanted));
+            phase = TASK_SEARCH;
+            phase_started_us = now_us;
         }
 
-        float dt = (last_t_us == 0) ? (AIM_PERIOD_MS / 1000.0f)
-                                    : (float)(now_us - last_t_us) / 1000000.0f;
-        if (dt <= 0.0f) {
-            dt = AIM_PERIOD_MS / 1000.0f;
-        }
-
-        float vx = 0.0f;
-        float wz = 0.0f;
-
-        if (fabsf(err_x) > AIM_DEADBAND_PX) {
-            /* Phase 1: rotate in place until x is centered. */
-            float derr_x = (err_x - last_err_x) / dt;
-            wz = AIM_KP * err_x + AIM_KD * derr_x;
-            if (wz > AIM_MAX_WZ) {
-                wz = AIM_MAX_WZ;
-            } else if (wz < -AIM_MAX_WZ) {
-                wz = -AIM_MAX_WZ;
+        switch (phase) {
+        case TASK_SEARCH:
+            if (!visible) {
+                /* Red is searched by turning left (CCW+); green by turning right. */
+                const float search_wz = wanted == BALL_RED ? SEARCH_WZ_RAD_S
+                                                            : -SEARCH_WZ_RAD_S;
+                set_speed(0.0f, 0.0f, search_wz);
+                break;
             }
-        } else if (fabsf(err_y) > AIM_DEADBAND_Y_PX) {
-            /* Phase 2: x aligned; drive forward/backward to center y. */
-            float derr_y = (err_y - last_err_y) / dt;
-            vx = AIM_Y_SIGN * (AIM_KP_Y * err_y + AIM_KD_Y * derr_y);
-            if (vx > AIM_MAX_VX_CM_S) {
-                vx = AIM_MAX_VX_CM_S;
-            } else if (vx < -AIM_MAX_VX_CM_S) {
-                vx = -AIM_MAX_VX_CM_S;
+            ESP_LOGI(TAG, "%s ball found at (%ld,%ld); locking approach direction", ball_name(wanted),
+                     (long)ball.cx, (long)ball.cy);
+            /*
+             * Lock the first sighting as a translation vector.  Using wz here
+             * would rotate for the whole five-second movement and make a circle.
+             * ROS y is left-positive; image x is right-positive.
+             */
+            const float lateral = clampf((image_center_x - ball.cx) / image_center_x,
+                                         -1.0f, 1.0f);
+            const float direction = atanf(lateral);
+            locked_approach_vx = APPROACH_SPEED_CM_S * cosf(direction);
+            locked_approach_vy = APPROACH_SPEED_CM_S * sinf(direction);
+            set_speed(0.0f, 0.0f, 0.0f);
+            phase = TASK_LOCK_DIRECTION;
+            phase_started_us = now_us;
+            break;
+
+        case TASK_LOCK_DIRECTION:
+            /* Keep still for one second after the initial ball direction is captured. */
+            set_speed(0.0f, 0.0f, 0.0f);
+            if (now_us - phase_started_us >= (int64_t)LOCK_DIRECTION_STOP_MS * 1000) {
+                ESP_LOGI(TAG, "%s direction locked; starting five-second approach",
+                         ball_name(wanted));
+                phase = TASK_APPROACH_BALL;
+                phase_started_us = now_us;
             }
+            break;
+
+        case TASK_APPROACH_BALL: {
+            /* Move in the fixed direction captured at first sighting; do not rotate. */
+            set_speed(locked_approach_vx, locked_approach_vy, 0.0f);
+            if (now_us - phase_started_us >= (int64_t)APPROACH_TIME_MS * 1000) {
+                set_speed(0.0f, 0.0f, 0.0f);
+                ESP_LOGI(TAG, "%s five-second approach complete; stopping", ball_name(wanted));
+                phase = TASK_STOP_AFTER_APPROACH;
+                phase_started_us = now_us;
+            }
+            break;
         }
 
-        set_speed(vx, 0.0f, wz);
-        static uint32_t s_aim_log_skip;
-        if ((s_aim_log_skip++ % 10) == 0) {
-            ESP_LOGI(TAG, "aim: ex=%.1f ey=%.1f vx=%.2f wz=%.2f",
-                     (double)err_x, (double)err_y, (double)vx, (double)wz);
-        }
+        case TASK_STOP_AFTER_APPROACH:
+            set_speed(0.0f, 0.0f, 0.0f);
+            if (now_us - phase_started_us >= (int64_t)STOP_AFTER_APPROACH_MS * 1000) {
+                phase = TASK_RETURN_TO_WAIT;
+                phase_started_us = now_us;
+            }
+            break;
 
-        last_err_x = err_x;
-        last_err_y = err_y;
-        last_t_us = now_us;
+        case TASK_RETURN_TO_WAIT:
+            set_speed(RETURN_SPEED_CM_S, 0.0f, 0.0f);
+            if (now_us - phase_started_us >= (int64_t)RETURN_TIME_MS * 1000) {
+                set_speed(0.0f, 0.0f, 0.0f);
+                if (wanted == BALL_RED) {
+                    wanted = BALL_GREEN;
+                    portENTER_CRITICAL(&s_ball_mux);
+                    s_detection_target = BALL_GREEN;
+                    portEXIT_CRITICAL(&s_ball_mux);
+                    phase = TASK_SEARCH;
+                    phase_started_us = now_us;
+                    ESP_LOGI(TAG, "return complete; searching for green ball");
+                } else {
+                    phase = TASK_COMPLETE;
+                    ESP_LOGI(TAG, "green ball complete; task finished and motors stopped");
+                }
+            }
+            break;
+
+        case TASK_COMPLETE:
+            break;
+        }
     }
 }
 
@@ -440,7 +509,8 @@ static bool is_mjpeg_format(const uvc_format_desc_t *format)
     return format->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG;
 }
 
-static bool is_red_rgb(int r, int g, int b, int mx, int mn, int delta)
+static bool is_ball_rgb(ball_color_t color, int r, int g, int b,
+                        int mx, int mn, int delta)
 {
     if (mx < RED_MIN_VALUE || delta < RED_MIN_SATURATION) {
         return false;
@@ -458,10 +528,13 @@ static bool is_red_rgb(int r, int g, int b, int mx, int mn, int delta)
         h6 += 360;
     }
 
-    return h6 <= RED_HUE_MAX_ANGLE || h6 >= RED_HUE_MIN_ANGLE;
+    if (color == BALL_RED) {
+        return h6 <= RED_HUE_MAX_ANGLE || h6 >= RED_HUE_MIN_ANGLE;
+    }
+    return h6 >= 65 && h6 <= 175;
 }
 
-static void detect_red_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
+static void detect_balls_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
 {
     esp_jpeg_image_cfg_t jpeg_cfg = {
         .indata = (uint8_t *)jpeg,
@@ -485,16 +558,13 @@ static void detect_red_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
     const bool log_now = (s_log_skip++ % 5) == 0;
 
     const uint16_t *decoded = (const uint16_t *)s_decode_buf;
-    uint32_t red_count = 0;
-    uint64_t sum_x = 0;
-    uint64_t sum_y = 0;
-    uint64_t mask_r_sum = 0;
-    uint64_t mask_g_sum = 0;
-    uint64_t mask_b_sum = 0;
-    uint64_t sat_r_sum = 0;
-    uint64_t sat_g_sum = 0;
-    uint64_t sat_b_sum = 0;
-    uint32_t sat_count = 0;
+    uint32_t count[BALL_COLOR_COUNT] = {0};
+    uint64_t sum_x[BALL_COLOR_COUNT] = {0};
+    uint64_t sum_y[BALL_COLOR_COUNT] = {0};
+    ball_color_t detection_target;
+    portENTER_CRITICAL(&s_ball_mux);
+    detection_target = s_detection_target;
+    portEXIT_CRITICAL(&s_ball_mux);
 
     for (uint32_t y = 0; y < image.height; ++y) {
         for (uint32_t x = 0; x < image.width; ++x) {
@@ -509,54 +579,43 @@ static void detect_red_mjpeg(const uint8_t *jpeg, size_t jpeg_len)
             mn = mn < b ? mn : b;
             const int delta = mx - mn;
 
-            if (mx >= RED_MIN_VALUE && delta >= RED_MIN_SATURATION) {
-                ++sat_count;
-                sat_r_sum += r;
-                sat_g_sum += g;
-                sat_b_sum += b;
+            for (ball_color_t color = BALL_RED; color < BALL_COLOR_COUNT; ++color) {
+                if (color == detection_target &&
+                    is_ball_rgb(color, r, g, b, mx, mn, delta)) {
+                    ++count[color];
+                    sum_x[color] += x;
+                    sum_y[color] += y;
+                }
             }
 
-            if (is_red_rgb(r, g, b, mx, mn, delta)) {
-                ++red_count;
-                sum_x += x;
-                sum_y += y;
-                mask_r_sum += r;
-                mask_g_sum += g;
-                mask_b_sum += b;
-            }
         }
     }
 
-    if (log_now && sat_count > 0) {
-        ESP_LOGI(TAG, "dbg sat n=%u rgb=(%u,%u,%u) | mask n=%u rgb=(%u,%u,%u)",
-                 (unsigned)sat_count,
-                 (unsigned)(sat_r_sum / sat_count),
-                 (unsigned)(sat_g_sum / sat_count),
-                 (unsigned)(sat_b_sum / sat_count),
-                 (unsigned)red_count,
-                 red_count > 0 ? (unsigned)(mask_r_sum / red_count) : 0,
-                 red_count > 0 ? (unsigned)(mask_g_sum / red_count) : 0,
-                 red_count > 0 ? (unsigned)(mask_b_sum / red_count) : 0);
-    }
-
-    const uint32_t pixel_count = (uint32_t)image.width * image.height;
-    const float ratio = 100.0f * red_count / pixel_count;
-    if (red_count != 0 && ratio >= RED_DETECT_RATIO_PERCENT) {
-        const uint32_t cx = (uint32_t)(sum_x * DECODE_SCALE_DIV / red_count);
-        const uint32_t cy = (uint32_t)(sum_y * DECODE_SCALE_DIV / red_count);
+    for (ball_color_t color = BALL_RED; color < BALL_COLOR_COUNT; ++color) {
+        if (color != detection_target) {
+            continue;
+        }
+        if (count[color] < BALL_MIN_PIXELS) {
+            continue;
+        }
+        int32_t cx = (int32_t)(sum_x[color] * s_decode_scale_divisor / count[color]);
+        int32_t cy = (int32_t)(sum_y[color] * s_decode_scale_divisor / count[color]);
+        if (CAMERA_FLIPPED) {
+            cx = (int32_t)s_frame_width - 1 - cx;
+            cy = (int32_t)s_frame_height - 1 - cy;
+        }
         portENTER_CRITICAL(&s_ball_mux);
-        s_ball.cx = (int32_t)cx;
-        s_ball.cy = (int32_t)cy;
-        s_ball.last_seen_us = esp_timer_get_time();
+        s_balls[color].cx = cx;
+        s_balls[color].cy = cy;
+        s_balls[color].pixels = count[color];
+        s_balls[color].last_seen_us = esp_timer_get_time();
         portEXIT_CRITICAL(&s_ball_mux);
         if (log_now) {
-            ESP_LOGI(TAG, "RED DETECTED red_pixels=%u center=(%u,%u) red=%.2f%%",
-                     (unsigned)red_count, (unsigned)cx, (unsigned)cy, (double)ratio);
+            ESP_LOGI(TAG, "%s detected: pixels=%u center=(%ld,%ld)",
+                     ball_name(color), (unsigned)count[color], (long)cx, (long)cy);
         }
-    } else if (log_now) {
-        ESP_LOGI(TAG, "red_pixels=%u center=(-1,-1) red=%.2f%%",
-                 (unsigned)red_count, (double)ratio);
     }
+
 }
 
 static bool jpeg_has_valid_markers(const uint8_t *data, size_t len)
@@ -615,7 +674,7 @@ static void frame_processing_task(void *arg)
         ESP_ERROR_CHECK(esp_task_wdt_reset());
         if (slot->len <= JPEG_FRAME_MAX_BYTES &&
             jpeg_has_valid_markers(slot->data, slot->len)) {
-            detect_red_mjpeg(slot->data, slot->len);
+            detect_balls_mjpeg(slot->data, slot->len);
         } else {
             ESP_LOGW(TAG, "dropping incomplete/corrupt JPEG (%u bytes)",
                      (unsigned)slot->len);
@@ -866,7 +925,7 @@ void app_main(void)
     motors_init();
     ESP_LOGI(TAG, "motors initialized");
     assert(xTaskCreate(speed_ctrl_task, "speed_ctrl", 4096, NULL, 5, NULL) == pdPASS);
-    assert(xTaskCreate(aim_ctrl_task, "aim_ctrl", 4096, NULL, 4, NULL) == pdPASS);
+    assert(xTaskCreate(ball_task_ctrl, "ball_task", 4096, NULL, 4, NULL) == pdPASS);
 
     libuvc_adapter_config_t adapter_config = {
         .create_background_task = true,
