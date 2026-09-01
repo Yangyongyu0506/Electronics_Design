@@ -1,0 +1,19 @@
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=16384
+CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
+
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+
+# Use the project-owned cooperative decoder rather than the ROM decoder.
+# The ROM jd_decomp() is non-preemptible and can starve an IDLE task long
+# enough to trip the task watchdog while processing a UVC MJPEG frame.
+CONFIG_JD_USE_ROM=n
+CONFIG_JD_SZBUF=1024
+CONFIG_JD_FORMAT_RGB888=y
+CONFIG_JD_USE_SCALE=y
+CONFIG_JD_TBLCLIP=y
+CONFIG_JD_FASTDECODE_32BIT=y
+# This UVC camera's MJPEG frames can omit DHT segments.  The ROM decoder
+# accepts them; enable the equivalent fallback tables in external TinyJPG.
+CONFIG_JD_DEFAULT_HUFFMAN=y
