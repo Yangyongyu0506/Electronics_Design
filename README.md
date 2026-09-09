@@ -51,3 +51,11 @@ HC-SR04:
         - SCK->GPIO21
         - CS->GND
         - RST->GPIO48
+
+    Servo:
+
+        - GPIO14
+
+    MPU6500:
+        - SCL->GPIO21
+        - SDA->GPIO47
