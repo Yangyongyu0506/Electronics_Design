@@ -46,6 +46,7 @@ CMD_STRUCT = struct.Struct("<IB3f")
 SCAN_SLOTS = 720
 RANGE_MIN = 0.15
 RANGE_MAX = 30.0
+MIN_SCAN_POINTS = 50
 
 (
     I_PX, I_PY, I_PZ,
@@ -70,6 +71,7 @@ class TranslaterNode(Node):
         self.odom_latest = None
         self.scan_latest = None
         self.last_seq = None
+        self.last_published_scan_seq = None
         self.publish_timer = self.create_timer(0.02, self.publish_latest)
 
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -195,9 +197,14 @@ class TranslaterNode(Node):
             self.tf_broadcaster.sendTransform(tf_msg)
 
         if scan is not None:
-            _seq, angles, dists, inten = scan
+            seq, angles, dists, inten = scan
+            if seq == self.last_published_scan_seq:
+                return
+            self.last_published_scan_seq = seq
+
             ranges = [float("inf")] * SCAN_SLOTS
             intensities = [float("nan")] * SCAN_SLOTS
+            n_valid = 0
             for a, d, i in zip(angles, dists, inten):
                 if d == 0xFFFF:
                     continue
@@ -207,6 +214,10 @@ class TranslaterNode(Node):
                 slot = int(round(a * SCAN_SLOTS / 36000.0)) % SCAN_SLOTS
                 ranges[slot] = dist
                 intensities[slot] = float(i)
+                n_valid += 1
+            if n_valid < MIN_SCAN_POINTS:
+                return
+
             msg = LaserScan()
             msg.header.stamp = now
             msg.header.frame_id = "laser_link"
