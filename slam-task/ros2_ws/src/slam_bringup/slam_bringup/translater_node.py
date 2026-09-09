@@ -211,7 +211,7 @@ class TranslaterNode(Node):
                 dist = d / 1000.0
                 if dist < RANGE_MIN or dist > RANGE_MAX:
                     continue
-                slot = int(round(a * SCAN_SLOTS / 36000.0)) % SCAN_SLOTS
+                slot = int(a * SCAN_SLOTS / 36000.0) % SCAN_SLOTS
                 ranges[slot] = dist
                 intensities[slot] = float(i)
                 n_valid += 1

@@ -23,7 +23,7 @@
 
 static const char *TAG = "slam";
 
-#define PC_IP_ADDR          "192.168.0.200"
+#define PC_IP_ADDR          "192.168.0.198"
 #define PC_PORT             34567
 #define NET_PERIOD_MS       20
 
@@ -568,24 +568,14 @@ static void lidar_task(void *arg)
             interval += 360.0f;
         }
 
-        int invalid = 0;
-        for (int n = 0; n < LIDAR_POINTS_PER_PKT; n++) {
-            const uint16_t d = (uint16_t)((pkt[7 + 3 * n] << 8) | pkt[8 + 3 * n]);
-            if (d == 0xFFFF) {
-                invalid++;
-            }
-        }
-        const int valid = LIDAR_POINTS_PER_PKT - invalid - 1;
-        if (valid <= 0) {
-            continue;
-        }
+        const float step_deg = interval / (float)(LIDAR_POINTS_PER_PKT - 1);
 
         for (int n = 0; n < LIDAR_POINTS_PER_PKT; n++) {
             const uint16_t d = (uint16_t)((pkt[7 + 3 * n] << 8) | pkt[8 + 3 * n]);
             if (d == 0xFFFF) {
                 continue;
             }
-            float deg = start_deg + interval / (float)valid * (float)n;
+            float deg = start_deg + step_deg * (float)n;
             if (deg >= 360.0f) {
                 deg -= 360.0f;
             }

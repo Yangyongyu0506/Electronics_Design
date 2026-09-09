@@ -29,7 +29,7 @@ slam_toolbox:
     transform_publish_period: 0.02 #if 0 never publishes odometry
     map_update_interval: 2.0
     resolution: 0.05
-    min_laser_range: 0.0 #for rastering images
+    min_laser_range: 0.15 #for rastering images (reject close-range LiDAR noise)
     max_laser_range: 10.0 #for rastering images (LSLIDAR N10 ~10 m)
     minimum_time_interval: 0.5
     transform_timeout: 0.2
