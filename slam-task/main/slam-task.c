@@ -23,7 +23,7 @@
 
 static const char *TAG = "slam";
 
-#define PC_IP_ADDR          "192.168.0.198"
+#define PC_IP_ADDR          "192.168.0.200"
 #define PC_PORT             34567
 #define NET_PERIOD_MS       20
 
@@ -49,6 +49,17 @@ static const char *TAG = "slam";
 #define WHEEL_A_SIGN        1.0f
 #define WHEEL_B_SIGN        1.0f
 #define WHEEL_D_SIGN        1.0f
+#define ODOM_SCALE          0.01f
+
+#define SPEED_CTRL_PERIOD_MS 20
+#define MAX_DUTY            1023
+#define PID_KP              2.0f
+#define PID_KI              0.5f
+#define PID_KD              0.0f
+#define PID_INTEGRAL_LIMIT  400.0f
+#define SPEED_FILTER_ALPHA  0.3f
+#define CMD_MAGIC           0x0D0D0003
+#define CMD_TIMEOUT_MS      500
 
 #define RAD_TO_DEG          (180.0f / 3.14159265f)
 
@@ -69,6 +80,35 @@ static float s_px, s_py;
 static float s_yaw;
 static float s_vx, s_vy;
 static float s_wz_wheel;
+static volatile uint64_t s_last_cmd_us;
+
+typedef struct {
+    float kp;
+    float ki;
+    float kd;
+    float integral;
+    float last_measured;
+} pid_ctrl_t;
+
+typedef struct {
+    int target_speed;
+    int last_count;
+    float measured_speed;
+    pid_ctrl_t pid;
+    bool saturated;
+} motor_ctrl_t;
+
+static motor_ctrl_t motors[MOTOR_COUNT] = {
+    {0, 0, 0, {PID_KP, PID_KI, PID_KD, 0, 0}, false},
+    {0, 0, 0, {PID_KP, PID_KI, PID_KD, 0, 0}, false},
+    {0, 0, 0, {PID_KP, PID_KI, PID_KD, 0, 0}, false},
+};
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t seq;
+    float vx, vy, wz;
+} cmd_vel_packet_t;
 
 typedef struct {
     float px, py, pz;
@@ -111,6 +151,129 @@ static void motor_brake_all(void)
     for (int i = 0; i < MOTOR_COUNT; i++) {
         gpio_set_level(s_motor_in1[i], 1);
         gpio_set_level(s_motor_in2[i], 1);
+    }
+}
+
+static float pid_update(pid_ctrl_t *pid, float error, float measured, bool saturated)
+{
+    float p_term = pid->kp * error;
+
+    if (!saturated) {
+        pid->integral += error;
+        if (pid->integral > PID_INTEGRAL_LIMIT) {
+            pid->integral = PID_INTEGRAL_LIMIT;
+        } else if (pid->integral < -PID_INTEGRAL_LIMIT) {
+            pid->integral = -PID_INTEGRAL_LIMIT;
+        }
+    }
+
+    float d_term = pid->kd * (pid->last_measured - measured);
+    pid->last_measured = measured;
+
+    return p_term + pid->ki * pid->integral + d_term;
+}
+
+static void pid_reset(pid_ctrl_t *pid)
+{
+    pid->integral = 0;
+    pid->last_measured = 0;
+}
+
+static void motor_set_target_cm_s(int index, float speed_cm_s)
+{
+    int new_target = (int)(speed_cm_s * COUNTS_PER_CM);
+
+    if (new_target == 0) {
+        motors[index].target_speed = 0;
+        gpio_set_level(s_motor_in1[index], 0);
+        gpio_set_level(s_motor_in2[index], 0);
+        pid_reset(&motors[index].pid);
+        return;
+    }
+
+    if ((new_target > 0) != (motors[index].target_speed > 0)) {
+        pid_reset(&motors[index].pid);
+    }
+    motors[index].target_speed = new_target;
+}
+
+static void set_speed(float vx, float vy, float wz)
+{
+    float va = 0.86602540378 * vx + 0.5 * vy + WHEEL_BASE_CM * wz;
+    float vd = -0.86602540378 * vx + 0.5 * vy + WHEEL_BASE_CM * wz;
+    float vb = -vy + WHEEL_BASE_CM * wz;
+
+    motor_set_target_cm_s(0, va);
+    motor_set_target_cm_s(1, vb);
+    motor_set_target_cm_s(2, vd);
+}
+
+static void speed_ctrl_task(void *arg)
+{
+    (void)arg;
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t iter = 0;
+    set_speed(0.0f, 0.0f, 0.0f);
+
+    while (1) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SPEED_CTRL_PERIOD_MS));
+
+        if (esp_timer_get_time() - s_last_cmd_us >
+            (uint64_t)CMD_TIMEOUT_MS * 1000) {
+            set_speed(0.0f, 0.0f, 0.0f);
+        }
+
+        for (int i = 0; i < MOTOR_COUNT; i++) {
+            int count = 0;
+            if (pcnt_unit_get_count(s_enc_units[i], &count) != ESP_OK) {
+                continue;
+            }
+            int delta = count - motors[i].last_count;
+            motors[i].last_count = count;
+
+            float measured_raw = (float)delta * 1000.0f / SPEED_CTRL_PERIOD_MS;
+            motors[i].measured_speed +=
+                (measured_raw - motors[i].measured_speed) * SPEED_FILTER_ALPHA;
+
+            float target = (float)motors[i].target_speed;
+            if (target == 0) {
+                continue;
+            }
+
+            float error = fabsf(target) - fabsf(motors[i].measured_speed);
+            float output = pid_update(&motors[i].pid, error,
+                                      fabsf(motors[i].measured_speed),
+                                      motors[i].saturated);
+
+            uint32_t duty;
+            motors[i].saturated = false;
+            if (output < 0) {
+                duty = 0;
+                motors[i].saturated = true;
+            } else if (output > MAX_DUTY) {
+                duty = MAX_DUTY;
+                motors[i].saturated = true;
+            } else {
+                duty = (uint32_t)output;
+            }
+
+            gpio_set_level(s_motor_in1[i], target > 0);
+            gpio_set_level(s_motor_in2[i], target < 0);
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,
+                                          s_motor_chan[i], duty));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,
+                                             s_motor_chan[i]));
+        }
+
+        if (++iter % 50 == 0) {
+            ESP_LOGI(TAG,
+                     "motors: t=[%d %d %d] m=[%.0f %.0f %.0f] c/s",
+                     motors[0].target_speed, motors[1].target_speed,
+                     motors[2].target_speed,
+                     (double)motors[0].measured_speed,
+                     (double)motors[1].measured_speed,
+                     (double)motors[2].measured_speed);
+        }
     }
 }
 
@@ -209,7 +372,7 @@ static void wheel_kinematics(float *vx, float *vy, float *wz)
         const int delta = count - s_last_counts[i];
         s_last_counts[i] = count;
         wheel_cm_s[i] = (float)delta / COUNTS_PER_CM * 1000.0f /
-                        (float)ODOM_PERIOD_MS;
+                        (float)ODOM_PERIOD_MS * ODOM_SCALE;
     }
 
     const float va = WHEEL_A_SIGN * wheel_cm_s[0];
@@ -532,6 +695,41 @@ static void net_task(void *arg)
                 sock = -1;
             }
         }
+
+        static uint8_t s_cmd_buf[128];
+        static int s_cmd_len;
+        uint8_t rxbuf[128];
+        int n = recv(sock, rxbuf, sizeof(rxbuf), MSG_DONTWAIT);
+        if (n > 0) {
+            for (int i = 0; i < n && s_cmd_len < (int)sizeof(s_cmd_buf); i++) {
+                s_cmd_buf[s_cmd_len++] = rxbuf[i];
+            }
+            while (s_cmd_len >= (int)sizeof(cmd_vel_packet_t)) {
+                cmd_vel_packet_t cmd;
+                memcpy(&cmd, s_cmd_buf, sizeof(cmd));
+                if (cmd.magic != CMD_MAGIC) {
+                    memmove(s_cmd_buf, s_cmd_buf + 1, sizeof(s_cmd_buf) - 1);
+                    s_cmd_len--;
+                    continue;
+                }
+                set_speed(cmd.vx * 100.0f,
+                          cmd.vy * 100.0f,
+                          cmd.wz);
+                s_last_cmd_us = (uint64_t)esp_timer_get_time();
+                static uint32_t s_cmd_log_skip;
+                if (++s_cmd_log_skip % 25 == 0) {
+                    ESP_LOGI(TAG, "cmd_vel: vx=%.2f vy=%.2f wz=%.2f",
+                             (double)cmd.vx, (double)cmd.vy, (double)cmd.wz);
+                }
+                memmove(s_cmd_buf, s_cmd_buf + sizeof(cmd),
+                        sizeof(s_cmd_buf) - sizeof(cmd));
+                s_cmd_len -= sizeof(cmd);
+            }
+        } else if (n == 0) {
+            ESP_LOGW(TAG, "connection closed by host; reconnecting");
+            close(sock);
+            sock = -1;
+        }
     }
 }
 
@@ -544,5 +742,6 @@ void app_main(void)
     encoders_init();
     assert(xTaskCreate(odom_task, "odom", 4096, NULL, 5, NULL) == pdPASS);
     assert(xTaskCreate(lidar_task, "lidar", 4096, NULL, 5, NULL) == pdPASS);
+    assert(xTaskCreate(speed_ctrl_task, "speed_ctrl", 4096, NULL, 5, NULL) == pdPASS);
     xTaskCreatePinnedToCore(net_task, "net", 4096, NULL, 4, NULL, 1);
 }

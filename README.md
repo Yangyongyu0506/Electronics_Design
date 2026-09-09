@@ -58,4 +58,4 @@ HC-SR04:
 
     MPU6500:
         - SCL->GPIO21
-        - SDA->GPIO47
+        - SDA->GPIO47   

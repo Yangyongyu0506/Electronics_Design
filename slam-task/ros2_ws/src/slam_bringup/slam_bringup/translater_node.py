@@ -6,6 +6,11 @@ car over one TCP connection and republishes them as standard ROS 2 topics:
 - /scan (sensor_msgs/LaserScan), frame laser_link
 - tf odom -> base_link (tf2_ros TransformBroadcaster)
 
+It also subscribes to /cmd_vel (geometry_msgs/Twist, m/s + rad/s) and forwards
+each command to the ESP32 over the same TCP connection:
+
+  msg 3 (cmd, 17 B): <I magic=0x0D0D0003 B seq 3f vx,vy,wz>
+
 TCP stream (little-endian):
   msg 1 (odom, 61 B): <I magic=0x0D0D0001 Q stamp_us 12f px,py,pz,yaw,qw,qx,
                        qy,qz,vx,vy,vz,wz B seq>
@@ -26,16 +31,18 @@ import threading
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from tf2_ros import TransformBroadcaster
 
 ODOM_MAGIC = 0x0D0D0001
 SCAN_MAGIC = 0x0D0D0002
+CMD_MAGIC = 0x0D0D0003
 LISTEN_PORT = 34567
 ODOM_STRUCT = struct.Struct("<IQ12fB")
 ODOM_BYTES = ODOM_STRUCT.size
+CMD_STRUCT = struct.Struct("<IB3f")
 SCAN_SLOTS = 720
 RANGE_MIN = 0.15
 RANGE_MAX = 30.0
@@ -55,7 +62,11 @@ class TranslaterNode(Node):
         self.odom_pub = self.create_publisher(Odometry, "/odom", 10)
         self.scan_pub = self.create_publisher(LaserScan, "/scan", 10)
         self.tf_broadcaster = TransformBroadcaster(self)
+        self.cmd_sub = self.create_subscription(Twist, "/cmd_vel", self.cmd_cb, 10)
         self.lock = threading.Lock()
+        self.conn_lock = threading.Lock()
+        self.conn = None
+        self.cmd_seq = 0
         self.odom_latest = None
         self.scan_latest = None
         self.last_seq = None
@@ -76,8 +87,23 @@ class TranslaterNode(Node):
             except OSError:
                 return
             self.get_logger().info(f"ESP32 connected from {addr[0]}:{addr[1]}")
+            with self.conn_lock:
+                self.conn = conn
             threading.Thread(target=self.recv_loop, args=(conn,),
                              daemon=True).start()
+
+    def cmd_cb(self, msg):
+        data = CMD_STRUCT.pack(CMD_MAGIC, self.cmd_seq & 0xFF,
+                               msg.linear.x, msg.linear.y, msg.angular.z)
+        self.cmd_seq += 1
+        with self.conn_lock:
+            conn = self.conn
+        if conn is None:
+            return
+        try:
+            conn.sendall(data)
+        except OSError as exc:
+            self.get_logger().debug(f"cmd_vel send failed: {exc}")
 
     def recv_loop(self, conn):
         buf = b""
@@ -126,6 +152,9 @@ class TranslaterNode(Node):
         except OSError as exc:
             self.get_logger().warn(f"socket error: {exc}")
         finally:
+            with self.conn_lock:
+                if self.conn is conn:
+                    self.conn = None
             self.get_logger().info("ESP32 disconnected")
             conn.close()
 

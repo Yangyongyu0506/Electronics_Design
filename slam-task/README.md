@@ -36,6 +36,11 @@ A minimal `slam_bringup` package (ament_python) receives the TCP stream and
 runs `slam_toolbox`. TF tree: `map → odom` (slam_toolbox), `odom → base_link`
 (translater from `/odom`), `base_link → laser_link` (static).
 
+The translater also subscribes `/cmd_vel` (m/s, m/s, rad/s) and forwards each
+command to the ESP32 as a 17-byte packet `<I magic=0x0D0D0003 B seq 3f vx,vy,wz>`.
+The ESP32 drives the 3 wheels with the motor-test PID speed loop; a 500 ms
+command watchdog stops the car.
+
 See `ros2_ws/README.md` for build, launch and map-saving steps.
 
 ## Tuning knobs (`main/slam-task.c`)
@@ -46,6 +51,8 @@ See `ros2_ws/README.md` for build, launch and map-saving steps.
   decreases x.
 - `COUNTS_PER_REV` (512), `WHEEL_DIAMETER_CM` (5.5), `WHEEL_BASE_CM` (9.0):
   odometry constants.
+- `ODOM_SCALE` (0.01): cm-to-metre conversion for the odometry (encoder distance is in cm). The motor PID targets use counts directly (512 counts/rev is correct), so no scale applies there.
+- `CMD_TIMEOUT_MS` (500): stop the car when cmd_vel stops arriving.
 
 ## Build & flash (ESP32)
 
