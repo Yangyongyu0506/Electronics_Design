@@ -23,7 +23,7 @@
 
 static const char *TAG = "slam";
 
-#define PC_IP_ADDR          "192.168.0.200"
+#define PC_IP_ADDR          "192.168.0.198"
 #define PC_PORT             34567
 #define NET_PERIOD_MS       20
 

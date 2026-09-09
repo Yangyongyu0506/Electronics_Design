@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Translater node: receives odometry and LiDAR scan data from the ESP32 car
-over one TCP connection and republishes them as standard ROS 2 topics:
+"""Translater node: receives wheel odometry and LiDAR scan data from the ESP32
+car over one TCP connection and republishes them as standard ROS 2 topics:
 
-- /odom (nav_msgs/Odometry), frame odom -> base_footprint
-- /scan (sensor_msgs/LaserScan), frame base_footprint (same as odom)
-- /tf (odom -> base_footprint, via tf2_ros TransformBroadcaster)
+- /odom (nav_msgs/Odometry), frame odom -> base_link
+- /scan (sensor_msgs/LaserScan), frame laser_link
+- tf odom -> base_link (tf2_ros TransformBroadcaster)
 
 TCP stream (little-endian):
-  msg 1 (odom, 61 B): <I magic=0x0D0D0001 Q stamp_us 3f px,py,pz f yaw
-                       4f qw,qx,qy,qz 3f vx,vy,vz f wz B seq>
-  msg 2 (scan): <I magic=0x0D0D0002 B seq H n_points
-                 H[n] angle_mdeg  H[n] dist_mm  B[n] intensity>
+  msg 1 (odom, 61 B): <I magic=0x0D0D0001 Q stamp_us 12f px,py,pz,yaw,qw,qx,
+                       qy,qz,vx,vy,vz,wz B seq>
+  msg 2 (scan):       <I magic=0x0D0D0002 B seq H n_points
+                       H[n] angle_mdeg  H[n] dist_mm  B[n] intensity>
 
-Usage (Ubuntu 24.04 / ROS 2 Jazzy):
-    source /opt/ros/jazzy/setup.bash
-    python3 translater_node.py
+Header stamps use the PC's ROS wall clock (not the ESP32's boot-relative
+stamp_us) so /odom and /scan share one clock domain for tf2 / SLAM Toolbox
+lookups; stamp_us is kept only for dropped-packet diagnostics.
+
+Usage (Ubuntu 22.04 / ROS 2 Humble):
+    ros2 run slam_bringup translater_node
 """
 
 import socket
@@ -55,6 +58,7 @@ class TranslaterNode(Node):
         self.lock = threading.Lock()
         self.odom_latest = None
         self.scan_latest = None
+        self.last_seq = None
         self.publish_timer = self.create_timer(0.02, self.publish_latest)
 
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -93,9 +97,15 @@ class TranslaterNode(Node):
                         if len(buf) < ODOM_BYTES:
                             break
                         data, buf = buf[:ODOM_BYTES], buf[ODOM_BYTES:]
-                        _, stamp, *vals, _ = ODOM_STRUCT.unpack(data)
+                        _, stamp_us, *vals, seq = ODOM_STRUCT.unpack(data)
+                        if self.last_seq is not None:
+                            dropped = (seq - self.last_seq - 1) & 0xFF
+                            if dropped:
+                                self.get_logger().debug(
+                                    f"dropped {dropped} odom packets")
+                        self.last_seq = seq
                         with self.lock:
-                            self.odom_latest = (stamp, vals)
+                            self.odom_latest = vals
                     elif magic == SCAN_MAGIC:
                         if len(buf) < 7:
                             break
@@ -125,13 +135,13 @@ class TranslaterNode(Node):
         with self.lock:
             odom = self.odom_latest
             scan = self.scan_latest
+
         if odom is not None:
-            stamp_us, v = odom
-            stamp = rclpy.time.Time(nanoseconds=stamp_us * 1000).to_msg()
+            v = odom
             msg = Odometry()
-            msg.header.stamp = stamp
+            msg.header.stamp = now
             msg.header.frame_id = "odom"
-            msg.child_frame_id = "base_footprint"
+            msg.child_frame_id = "base_link"
             msg.pose.pose.position.x = float(v[I_PX])
             msg.pose.pose.position.y = float(v[I_PY])
             msg.pose.pose.position.z = float(v[I_PZ])
@@ -146,9 +156,9 @@ class TranslaterNode(Node):
             self.odom_pub.publish(msg)
 
             tf_msg = TransformStamped()
-            tf_msg.header.stamp = stamp
+            tf_msg.header.stamp = now
             tf_msg.header.frame_id = "odom"
-            tf_msg.child_frame_id = "base_footprint"
+            tf_msg.child_frame_id = "base_link"
             tf_msg.transform.translation.x = msg.pose.pose.position.x
             tf_msg.transform.translation.y = msg.pose.pose.position.y
             tf_msg.transform.translation.z = msg.pose.pose.position.z
@@ -156,7 +166,7 @@ class TranslaterNode(Node):
             self.tf_broadcaster.sendTransform(tf_msg)
 
         if scan is not None:
-            seq, angles, dists, inten = scan
+            _seq, angles, dists, inten = scan
             ranges = [float("inf")] * SCAN_SLOTS
             intensities = [float("nan")] * SCAN_SLOTS
             for a, d, i in zip(angles, dists, inten):
@@ -170,7 +180,7 @@ class TranslaterNode(Node):
                 intensities[slot] = float(i)
             msg = LaserScan()
             msg.header.stamp = now
-            msg.header.frame_id = "base_footprint"
+            msg.header.frame_id = "laser_link"
             msg.angle_min = 0.0
             msg.angle_max = 6.283185307179586
             msg.angle_increment = 6.283185307179586 / SCAN_SLOTS

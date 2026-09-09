@@ -56,3 +56,13 @@ dkms.conf
 
 **/.vscode
 **/build
+
+# ROS2 / colcon
+**/build/
+**/install/
+**/log/
+
+# Python
+**/__pycache__/
+*.pyc
+*.pyo
